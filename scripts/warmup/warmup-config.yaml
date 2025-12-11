@@ -1,0 +1,61 @@
+# Warmup Configuration
+# This file defines what gets warmed up in the snapshot
+
+# Repository to clone
+repository:
+  url: "https://github.com/your-org/your-repo.git"
+  branch: "main"
+  depth: 1  # Shallow clone
+
+# Bazel configuration
+bazel:
+  # Version to use (via Bazelisk)
+  version: "7.x"
+  
+  # Cache settings
+  disk_cache: "/home/runner/.cache/bazel-disk"
+  repository_cache: "/home/runner/.cache/bazel-repo"
+  
+  # Memory settings
+  max_heap_size: "4g"
+  
+  # Additional bazelrc content
+  extra_config: |
+    build --remote_cache=grpcs://your-remote-cache.example.com
+    build --remote_upload_local_results=false
+
+# Warmup targets
+warmup:
+  # Targets to fetch (populates repo cache)
+  fetch_targets:
+    - "//..."
+  
+  # Targets to analyze (loads analysis graph)
+  analyze_targets:
+    - "//..."
+  
+  # Targets to actually build (populates action cache)
+  build_targets:
+    - "//common/..."
+    - "//lib/..."
+    # Add frequently-used targets here
+  
+  # Timeout for warmup phase
+  timeout_minutes: 30
+
+# Environment variables
+environment:
+  JAVA_HOME: "/usr/lib/jvm/java-17-openjdk-amd64"
+  PATH: "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Post-warmup cleanup
+cleanup:
+  # Remove these before snapshot
+  remove_paths:
+    - "/tmp/*"
+    - "/var/tmp/*"
+    - "/home/runner/.bash_history"
+  
+  # Clear these caches (they'll be repopulated)
+  clear_caches: false
+

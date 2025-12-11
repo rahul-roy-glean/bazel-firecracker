@@ -1,0 +1,248 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: firecracker-runner
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    alerting:
+      alertmanagers:
+      - static_configs:
+        - targets:
+          - alertmanager:9093
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      # Control plane metrics
+      - job_name: 'control-plane'
+        kubernetes_sd_configs:
+        - role: pod
+          namespaces:
+            names:
+            - firecracker-runner
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+          action: replace
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+          target_label: __address__
+
+      # Host agent metrics (via federation or push gateway)
+      - job_name: 'firecracker-hosts'
+        gce_sd_configs:
+        - project: PROJECT_ID
+          zone: us-central1-a
+          filter: 'labels.firecracker-host=true'
+          port: 9090
+        relabel_configs:
+        - source_labels: [__meta_gce_instance_name]
+          target_label: instance_name
+        - source_labels: [__meta_gce_zone]
+          target_label: zone
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: firecracker-runner
+data:
+  firecracker-alerts.yml: |
+    groups:
+    - name: firecracker-host-alerts
+      rules:
+      - alert: HostUnhealthy
+        expr: up{job="firecracker-hosts"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Firecracker host {{ $labels.instance_name }} is unhealthy"
+          description: "Host has been down for more than 2 minutes"
+
+      - alert: HostHighCPU
+        expr: firecracker_host_cpu_usage > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU on host {{ $labels.instance_name }}"
+          description: "CPU usage is above 90% for 5 minutes"
+
+      - alert: HostAtCapacity
+        expr: firecracker_host_used_slots / firecracker_host_total_slots > 0.95
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host {{ $labels.instance_name }} at capacity"
+          description: "Host has less than 5% capacity remaining"
+
+      - alert: NoIdleRunners
+        expr: sum(firecracker_host_idle_runners) == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No idle runners available"
+          description: "All runners are busy, new jobs may be delayed"
+
+    - name: firecracker-runner-alerts
+      rules:
+      - alert: RunnerRestoreSlowdown
+        expr: histogram_quantile(0.95, firecracker_runner_restore_latency_seconds_bucket) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Runner restore latency is high"
+          description: "P95 restore latency is above 5 seconds"
+
+      - alert: RunnerAllocationFailures
+        expr: rate(firecracker_runner_allocations_total{status="failed"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Runner allocation failures detected"
+          description: "More than 10% of allocations are failing"
+
+    - name: firecracker-snapshot-alerts
+      rules:
+      - alert: SnapshotSyncFailure
+        expr: increase(firecracker_snapshot_sync_errors_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Snapshot sync failures detected"
+          description: "One or more hosts failed to sync snapshots"
+
+      - alert: SnapshotCacheStale
+        expr: time() - firecracker_snapshot_cache_last_sync_timestamp > 7200
+        labels:
+          severity: warning
+        annotations:
+          summary: "Snapshot cache is stale"
+          description: "Local cache hasn't been updated in over 2 hours"
+
+      - alert: SnapshotTooOld
+        expr: time() - firecracker_snapshot_created_timestamp > 86400
+        labels:
+          severity: info
+        annotations:
+          summary: "Active snapshot is more than 24 hours old"
+          description: "Consider building a fresh snapshot"
+
+    - name: firecracker-control-plane-alerts
+      rules:
+      - alert: ControlPlaneHighLatency
+        expr: histogram_quantile(0.95, firecracker_grpc_request_duration_seconds_bucket) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Control plane latency is high"
+          description: "P95 gRPC latency is above 1 second"
+
+      - alert: QueueDepthHigh
+        expr: firecracker_scheduler_queue_depth > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job queue depth is high"
+          description: "More than 50 jobs waiting for runners"
+
+      - alert: DatabaseConnectionFailure
+        expr: firecracker_db_connection_errors_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection failures"
+          description: "Control plane cannot connect to database"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: firecracker-runner
+data:
+  firecracker-overview.json: |
+    {
+      "dashboard": {
+        "title": "Firecracker Runner Overview",
+        "panels": [
+          {
+            "title": "Total Hosts",
+            "type": "stat",
+            "targets": [
+              {"expr": "count(up{job=\"firecracker-hosts\"})"}
+            ]
+          },
+          {
+            "title": "Total Runners",
+            "type": "stat",
+            "targets": [
+              {"expr": "sum(firecracker_host_used_slots)"}
+            ]
+          },
+          {
+            "title": "Idle Runners",
+            "type": "stat",
+            "targets": [
+              {"expr": "sum(firecracker_host_idle_runners)"}
+            ]
+          },
+          {
+            "title": "Busy Runners",
+            "type": "stat",
+            "targets": [
+              {"expr": "sum(firecracker_host_busy_runners)"}
+            ]
+          },
+          {
+            "title": "Runner Restore Latency (P95)",
+            "type": "graph",
+            "targets": [
+              {"expr": "histogram_quantile(0.95, sum(rate(firecracker_runner_restore_latency_seconds_bucket[5m])) by (le))"}
+            ]
+          },
+          {
+            "title": "Allocations per Minute",
+            "type": "graph",
+            "targets": [
+              {"expr": "sum(rate(firecracker_runner_allocations_total[1m])) * 60"}
+            ]
+          },
+          {
+            "title": "Host Capacity",
+            "type": "graph",
+            "targets": [
+              {"expr": "firecracker_host_used_slots / firecracker_host_total_slots", "legendFormat": "{{instance_name}}"}
+            ]
+          },
+          {
+            "title": "Snapshot Sync Duration",
+            "type": "graph",
+            "targets": [
+              {"expr": "histogram_quantile(0.95, sum(rate(firecracker_snapshot_sync_duration_seconds_bucket[5m])) by (le))"}
+            ]
+          }
+        ]
+      }
+    }
+

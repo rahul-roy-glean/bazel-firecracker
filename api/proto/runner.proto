@@ -1,0 +1,237 @@
+syntax = "proto3";
+
+package runner;
+
+option go_package = "github.com/anthropic/bazel-firecracker/api/proto/runner";
+
+import "google/protobuf/timestamp.proto";
+
+// HostAgent service runs on each Firecracker host VM
+service HostAgent {
+  // AllocateRunner allocates a new runner on this host
+  rpc AllocateRunner(AllocateRunnerRequest) returns (AllocateRunnerResponse);
+  
+  // ReleaseRunner releases a runner back to the pool or destroys it
+  rpc ReleaseRunner(ReleaseRunnerRequest) returns (ReleaseRunnerResponse);
+  
+  // GetHostStatus returns the current status of the host
+  rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
+  
+  // Heartbeat sends a heartbeat to the control plane
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // SyncSnapshot triggers a snapshot sync from GCS
+  rpc SyncSnapshot(SyncSnapshotRequest) returns (SyncSnapshotResponse);
+  
+  // ListRunners lists all runners on this host
+  rpc ListRunners(ListRunnersRequest) returns (ListRunnersResponse);
+  
+  // GetRunner gets details about a specific runner
+  rpc GetRunner(GetRunnerRequest) returns (Runner);
+}
+
+// ControlPlane service runs in GKE
+service ControlPlane {
+  // GetRunner requests a runner from the pool
+  rpc GetRunner(GetRunnerRequest) returns (GetRunnerResponse);
+  
+  // ReleaseRunner releases a runner
+  rpc ReleaseRunner(ReleaseRunnerRequest) returns (ReleaseRunnerResponse);
+  
+  // RegisterHost registers a new host with the control plane
+  rpc RegisterHost(RegisterHostRequest) returns (RegisterHostResponse);
+  
+  // HostHeartbeat receives heartbeats from hosts
+  rpc HostHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // GetSnapshot gets the current snapshot version
+  rpc GetSnapshot(GetSnapshotRequest) returns (Snapshot);
+  
+  // TriggerSnapshotBuild triggers a new snapshot build
+  rpc TriggerSnapshotBuild(TriggerSnapshotBuildRequest) returns (TriggerSnapshotBuildResponse);
+}
+
+// Runner states
+enum RunnerState {
+  RUNNER_STATE_UNSPECIFIED = 0;
+  RUNNER_STATE_COLD = 1;
+  RUNNER_STATE_BOOTING = 2;
+  RUNNER_STATE_INITIALIZING = 3;
+  RUNNER_STATE_IDLE = 4;
+  RUNNER_STATE_BUSY = 5;
+  RUNNER_STATE_DRAINING = 6;
+  RUNNER_STATE_RETIRING = 7;
+  RUNNER_STATE_TERMINATED = 8;
+}
+
+// Host states
+enum HostState {
+  HOST_STATE_UNSPECIFIED = 0;
+  HOST_STATE_STARTING = 1;
+  HOST_STATE_READY = 2;
+  HOST_STATE_DRAINING = 3;
+  HOST_STATE_UNHEALTHY = 4;
+}
+
+// Resources requested for a runner
+message Resources {
+  int32 vcpus = 1;
+  int32 memory_mb = 2;
+  int32 disk_gb = 3;
+}
+
+// Runner represents a single runner instance
+message Runner {
+  string id = 1;
+  string host_id = 2;
+  RunnerState state = 3;
+  string internal_ip = 4;
+  string github_runner_id = 5;
+  string job_id = 6;
+  string snapshot_version = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp started_at = 9;
+  Resources resources = 10;
+}
+
+// HostStatus represents the current status of a host
+message HostStatus {
+  string host_id = 1;
+  string instance_name = 2;
+  string zone = 3;
+  HostState state = 4;
+  int32 total_slots = 5;
+  int32 used_slots = 6;
+  int32 idle_runners = 7;
+  int32 busy_runners = 8;
+  double cpu_usage = 9;
+  double memory_usage = 10;
+  double disk_usage = 11;
+  string snapshot_version = 12;
+  google.protobuf.Timestamp snapshot_synced_at = 13;
+  google.protobuf.Timestamp last_heartbeat = 14;
+}
+
+// Snapshot represents a snapshot version
+message Snapshot {
+  string version = 1;
+  string status = 2;
+  string gcs_path = 3;
+  string bazel_version = 4;
+  string repo_commit = 5;
+  int64 size_bytes = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+// AllocateRunnerRequest
+message AllocateRunnerRequest {
+  string request_id = 1;
+  string repo = 2;
+  string branch = 3;
+  string commit = 4;
+  Resources resources = 5;
+  map<string, string> labels = 6;
+  string github_runner_token = 7;
+}
+
+// AllocateRunnerResponse
+message AllocateRunnerResponse {
+  Runner runner = 1;
+  string error = 2;
+}
+
+// ReleaseRunnerRequest
+message ReleaseRunnerRequest {
+  string runner_id = 1;
+  bool destroy = 2;
+}
+
+// ReleaseRunnerResponse
+message ReleaseRunnerResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// GetHostStatusRequest
+message GetHostStatusRequest {}
+
+// HeartbeatRequest
+message HeartbeatRequest {
+  string host_id = 1;
+  HostStatus status = 2;
+}
+
+// HeartbeatResponse
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  string snapshot_version = 2;
+  bool should_sync_snapshot = 3;
+  bool should_drain = 4;
+}
+
+// SyncSnapshotRequest
+message SyncSnapshotRequest {
+  string version = 1;
+}
+
+// SyncSnapshotResponse
+message SyncSnapshotResponse {
+  bool success = 1;
+  string error = 2;
+  string synced_version = 3;
+}
+
+// ListRunnersRequest
+message ListRunnersRequest {
+  RunnerState state_filter = 1;
+}
+
+// ListRunnersResponse
+message ListRunnersResponse {
+  repeated Runner runners = 1;
+}
+
+// GetRunnerRequest
+message GetRunnerRequest {
+  string runner_id = 1;
+}
+
+// GetRunnerResponse
+message GetRunnerResponse {
+  Runner runner = 1;
+  string host_address = 2;
+  string error = 3;
+}
+
+// RegisterHostRequest
+message RegisterHostRequest {
+  string instance_name = 1;
+  string zone = 2;
+  int32 total_slots = 3;
+  string snapshot_version = 4;
+}
+
+// RegisterHostResponse
+message RegisterHostResponse {
+  string host_id = 1;
+  string snapshot_version = 2;
+}
+
+// GetSnapshotRequest
+message GetSnapshotRequest {
+  string version = 1;
+}
+
+// TriggerSnapshotBuildRequest
+message TriggerSnapshotBuildRequest {
+  string repo = 1;
+  string branch = 2;
+  string bazel_version = 3;
+}
+
+// TriggerSnapshotBuildResponse
+message TriggerSnapshotBuildResponse {
+  string build_id = 1;
+  string status = 2;
+}
+

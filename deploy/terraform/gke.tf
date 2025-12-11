@@ -1,0 +1,150 @@
+# GKE Cluster for Control Plane
+resource "google_container_cluster" "control_plane" {
+  provider = google-beta
+
+  name     = "${local.name_prefix}-control-plane"
+  location = var.region
+
+  # Use regional cluster for HA
+  node_locations = [
+    "${var.region}-a",
+    "${var.region}-b",
+    "${var.region}-c",
+  ]
+
+  network    = google_compute_network.main.name
+  subnetwork = google_compute_subnetwork.gke.name
+
+  # Enable Workload Identity
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  # Private cluster configuration
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = false
+    master_ipv4_cidr_block  = "172.16.0.0/28"
+  }
+
+  # IP allocation policy for VPC-native cluster
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
+  }
+
+  # Remove default node pool
+  remove_default_node_pool = true
+  initial_node_count       = 1
+
+  # Master authorized networks
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = var.vpc_cidr
+      display_name = "VPC"
+    }
+  }
+
+  # Enable required addons
+  addons_config {
+    http_load_balancing {
+      disabled = false
+    }
+    horizontal_pod_autoscaling {
+      disabled = false
+    }
+    gce_persistent_disk_csi_driver_config {
+      enabled = true
+    }
+  }
+
+  # Logging and monitoring
+  logging_config {
+    enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
+  }
+
+  monitoring_config {
+    enable_components = ["SYSTEM_COMPONENTS"]
+    managed_prometheus {
+      enabled = true
+    }
+  }
+
+  # Maintenance window
+  maintenance_policy {
+    daily_maintenance_window {
+      start_time = "03:00"
+    }
+  }
+
+  resource_labels = local.labels
+
+  depends_on = [
+    google_compute_subnetwork.gke,
+    google_project_service.apis,
+  ]
+}
+
+# Node pool for control plane services
+resource "google_container_node_pool" "control_plane" {
+  name       = "${local.name_prefix}-control-plane-pool"
+  location   = var.region
+  cluster    = google_container_cluster.control_plane.name
+  node_count = var.gke_min_nodes
+
+  autoscaling {
+    min_node_count = var.gke_min_nodes
+    max_node_count = var.gke_max_nodes
+  }
+
+  management {
+    auto_repair  = true
+    auto_upgrade = true
+  }
+
+  node_config {
+    machine_type = var.gke_node_machine_type
+    disk_size_gb = 100
+    disk_type    = "pd-ssd"
+
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform",
+    ]
+
+    labels = merge(local.labels, {
+      node_pool = "control-plane"
+    })
+
+    # Enable Workload Identity on nodes
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_integrity_monitoring = true
+    }
+  }
+
+  upgrade_settings {
+    max_surge       = 1
+    max_unavailable = 0
+  }
+}
+
+# Workload Identity binding for control plane service account
+resource "google_service_account_iam_member" "control_plane_workload_identity" {
+  service_account_id = google_service_account.control_plane.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[firecracker-runner/control-plane]"
+}
+
+# Kubernetes namespace (created via kubectl, referenced here for documentation)
+# kubectl create namespace firecracker-runner
+
+# Output cluster credentials command
+output "gke_get_credentials" {
+  value       = "gcloud container clusters get-credentials ${google_container_cluster.control_plane.name} --region ${var.region} --project ${var.project_id}"
+  description = "Command to get GKE credentials"
+}
+

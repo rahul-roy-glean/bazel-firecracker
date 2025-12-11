@@ -1,0 +1,12 @@
+[Match]
+Name=eth0
+
+[Network]
+# Network configuration is injected via MMDS and applied by thaw-agent
+# This is a fallback DHCP configuration
+DHCP=yes
+
+[DHCP]
+UseDNS=yes
+UseNTP=no
+

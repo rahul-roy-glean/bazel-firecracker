@@ -28,6 +28,12 @@ service HostAgent {
   
   // GetRunner gets details about a specific runner
   rpc GetRunner(GetRunnerRequest) returns (Runner);
+
+  // QuarantineRunner isolates a runner for debugging (e.g. block egress, pause VM)
+  rpc QuarantineRunner(QuarantineRunnerRequest) returns (QuarantineRunnerResponse);
+
+  // UnquarantineRunner removes isolation and optionally resumes a paused runner
+  rpc UnquarantineRunner(UnquarantineRunnerRequest) returns (UnquarantineRunnerResponse);
 }
 
 // ControlPlane service runs in GKE
@@ -60,8 +66,9 @@ enum RunnerState {
   RUNNER_STATE_IDLE = 4;
   RUNNER_STATE_BUSY = 5;
   RUNNER_STATE_DRAINING = 6;
-  RUNNER_STATE_RETIRING = 7;
-  RUNNER_STATE_TERMINATED = 8;
+  RUNNER_STATE_QUARANTINED = 7;
+  RUNNER_STATE_RETIRING = 8;
+  RUNNER_STATE_TERMINATED = 9;
 }
 
 // Host states
@@ -201,6 +208,30 @@ message GetRunnerResponse {
   Runner runner = 1;
   string host_address = 2;
   string error = 3;
+}
+
+message QuarantineRunnerRequest {
+  string runner_id = 1;
+  string reason = 2;
+  bool block_egress = 3;
+  bool pause_vm = 4;
+}
+
+message QuarantineRunnerResponse {
+  bool success = 1;
+  string error = 2;
+  string quarantine_dir = 3;
+}
+
+message UnquarantineRunnerRequest {
+  string runner_id = 1;
+  bool unblock_egress = 2;
+  bool resume_vm = 3;
+}
+
+message UnquarantineRunnerResponse {
+  bool success = 1;
+  string error = 2;
 }
 
 // RegisterHostRequest

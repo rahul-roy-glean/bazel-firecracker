@@ -39,6 +39,7 @@ var (
 	buildbarnCertsDir    = flag.String("buildbarn-certs-dir", "", "Host directory containing Buildbarn certs to mount into microVMs (e.g. /etc/glean/ci/certs)")
 	buildbarnCertsMount  = flag.String("buildbarn-certs-mount", "/etc/bazel-firecracker/certs/buildbarn", "Guest mount path for Buildbarn certs inside the microVM")
 	buildbarnCertsSizeMB = flag.Int("buildbarn-certs-image-size-mb", 32, "Size in MB of the generated Buildbarn certs ext4 image")
+	quarantineDir        = flag.String("quarantine-dir", "/mnt/nvme/quarantine", "Directory to store quarantined runner manifests and debug metadata")
 	microVMSubnet        = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
 	extInterface         = flag.String("ext-interface", "eth0", "External network interface")
 	bridgeName           = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
@@ -97,6 +98,7 @@ func main() {
 		BuildbarnCertsDir:         *buildbarnCertsDir,
 		BuildbarnCertsMountPath:   *buildbarnCertsMount,
 		BuildbarnCertsImageSizeMB: *buildbarnCertsSizeMB,
+		QuarantineDir:             *quarantineDir,
 		MicroVMSubnet:             *microVMSubnet,
 		ExternalInterface:         *extInterface,
 		BridgeName:                *bridgeName,
@@ -152,6 +154,8 @@ func main() {
 	httpMux.HandleFunc("/health", healthHandler(mgr))
 	httpMux.HandleFunc("/ready", readyHandler(mgr))
 	httpMux.Handle("/metrics", promhttp.Handler())
+	httpMux.HandleFunc("/api/v1/runners/quarantine", quarantineRunnerHandler(mgr, logger))
+	httpMux.HandleFunc("/api/v1/runners/unquarantine", unquarantineRunnerHandler(mgr, logger))
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),

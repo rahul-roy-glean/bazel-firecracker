@@ -64,9 +64,9 @@ func (n *NATNetwork) Setup() error {
 	defer n.mu.Unlock()
 
 	n.logger.WithFields(logrus.Fields{
-		"bridge":   n.bridgeName,
-		"subnet":   n.subnet.String(),
-		"gateway":  n.gateway.String(),
+		"bridge":    n.bridgeName,
+		"subnet":    n.subnet.String(),
+		"gateway":   n.gateway.String(),
 		"ext_iface": n.externalIface,
 	}).Info("Setting up NAT network")
 
@@ -208,11 +208,11 @@ func (n *NATNetwork) setupNAT() error {
 
 // TapDevice represents a TAP network device
 type TapDevice struct {
-	Name      string
-	IP        net.IP
-	Gateway   net.IP
-	Subnet    *net.IPNet
-	MAC       string
+	Name       string
+	IP         net.IP
+	Gateway    net.IP
+	Subnet     *net.IPNet
+	MAC        string
 	BridgeName string
 }
 
@@ -363,6 +363,67 @@ func (n *NATNetwork) GetBridgeName() string {
 	return n.bridgeName
 }
 
+// BlockEgress blocks internet egress for the given VM IP by inserting iptables
+// rules ahead of the general ACCEPT forward rules.
+func (n *NATNetwork) BlockEgress(ip net.IP) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("invalid IPv4 address: %s", ip.String())
+	}
+
+	ipStr := ip4.String()
+	n.logger.WithFields(logrus.Fields{
+		"ip":        ipStr,
+		"ext_iface": n.externalIface,
+	}).Info("Blocking VM egress")
+
+	outCheck := []string{"-C", "FORWARD", "-i", n.bridgeName, "-s", ipStr, "-o", n.externalIface, "-j", "DROP"}
+	if err := exec.Command("iptables", outCheck...).Run(); err != nil {
+		outAdd := []string{"-I", "FORWARD", "1", "-i", n.bridgeName, "-s", ipStr, "-o", n.externalIface, "-j", "DROP"}
+		if err := exec.Command("iptables", outAdd...).Run(); err != nil {
+			return fmt.Errorf("failed to insert egress drop rule: %w", err)
+		}
+	}
+
+	inCheck := []string{"-C", "FORWARD", "-i", n.externalIface, "-d", ipStr, "-o", n.bridgeName, "-j", "DROP"}
+	if err := exec.Command("iptables", inCheck...).Run(); err != nil {
+		inAdd := []string{"-I", "FORWARD", "1", "-i", n.externalIface, "-d", ipStr, "-o", n.bridgeName, "-j", "DROP"}
+		if err := exec.Command("iptables", inAdd...).Run(); err != nil {
+			return fmt.Errorf("failed to insert ingress drop rule: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// UnblockEgress removes iptables rules that block internet egress for the given VM IP.
+func (n *NATNetwork) UnblockEgress(ip net.IP) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("invalid IPv4 address: %s", ip.String())
+	}
+
+	ipStr := ip4.String()
+	n.logger.WithFields(logrus.Fields{
+		"ip":        ipStr,
+		"ext_iface": n.externalIface,
+	}).Info("Unblocking VM egress")
+
+	outRule := []string{"-D", "FORWARD", "-i", n.bridgeName, "-s", ipStr, "-o", n.externalIface, "-j", "DROP"}
+	_ = exec.Command("iptables", outRule...).Run()
+
+	inRule := []string{"-D", "FORWARD", "-i", n.externalIface, "-d", ipStr, "-o", n.bridgeName, "-j", "DROP"}
+	_ = exec.Command("iptables", inRule...).Run()
+
+	return nil
+}
+
 // Cleanup removes the bridge and NAT rules
 func (n *NATNetwork) Cleanup() error {
 	n.mu.Lock()
@@ -441,5 +502,3 @@ func (t *TapDevice) GetNetworkConfig() NetworkConfig {
 		MAC:       t.MAC,
 	}
 }
-
-

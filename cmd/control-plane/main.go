@@ -22,16 +22,16 @@ import (
 )
 
 var (
-	grpcPort     = flag.Int("grpc-port", 50051, "gRPC server port")
-	httpPort     = flag.Int("http-port", 8080, "HTTP server port")
-	dbHost       = flag.String("db-host", "localhost", "Database host")
-	dbPort       = flag.Int("db-port", 5432, "Database port")
-	dbUser       = flag.String("db-user", "postgres", "Database user")
-	dbPassword   = flag.String("db-password", "", "Database password")
-	dbName       = flag.String("db-name", "firecracker_runner", "Database name")
-	dbSSLMode    = flag.String("db-ssl-mode", "disable", "Database SSL mode")
-	gcsBucket    = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
-	logLevel     = flag.String("log-level", "info", "Log level")
+	grpcPort   = flag.Int("grpc-port", 50051, "gRPC server port")
+	httpPort   = flag.Int("http-port", 8080, "HTTP server port")
+	dbHost     = flag.String("db-host", "localhost", "Database host")
+	dbPort     = flag.Int("db-port", 5432, "Database port")
+	dbUser     = flag.String("db-user", "postgres", "Database user")
+	dbPassword = flag.String("db-password", "", "Database password")
+	dbName     = flag.String("db-name", "firecracker_runner", "Database name")
+	dbSSLMode  = flag.String("db-ssl-mode", "disable", "Database SSL mode")
+	gcsBucket  = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
+	logLevel   = flag.String("log-level", "info", "Log level")
 )
 
 func main() {
@@ -52,7 +52,7 @@ func main() {
 	// Connect to database
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		*dbHost, *dbPort, *dbUser, *dbPassword, *dbName, *dbSSLMode)
-	
+
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to connect to database")
@@ -113,6 +113,8 @@ func main() {
 	})
 	httpMux.Handle("/metrics", promhttp.Handler())
 	httpMux.HandleFunc("/api/v1/runners", controlPlaneServer.HandleGetRunners)
+	httpMux.HandleFunc("/api/v1/runners/quarantine", controlPlaneServer.HandleQuarantineRunner)
+	httpMux.HandleFunc("/api/v1/runners/unquarantine", controlPlaneServer.HandleUnquarantineRunner)
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
 	httpMux.HandleFunc("/api/v1/snapshots", controlPlaneServer.HandleGetSnapshots)
 	httpMux.HandleFunc("/webhook/github", controlPlaneServer.HandleGitHubWebhook)
@@ -241,5 +243,3 @@ func (s *ControlPlaneServer) HandleGitHubWebhook(w http.ResponseWriter, r *http.
 	// Handled in webhook.go
 	w.WriteHeader(http.StatusOK)
 }
-
-

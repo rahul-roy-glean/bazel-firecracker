@@ -192,6 +192,10 @@ resource "google_compute_region_autoscaler" "hosts" {
     min_replicas    = var.min_hosts
     max_replicas    = var.max_hosts
     cooldown_period = 120
+    # IMPORTANT: only scale out via the managed autoscaler. Scale-in should be
+    # handled explicitly by the control plane so we never terminate hosts with
+    # busy nested microVMs.
+    mode = "ONLY_UP"
 
     # Scale based on custom metric: queue depth
     metric {
@@ -204,13 +208,12 @@ resource "google_compute_region_autoscaler" "hosts" {
     cpu_utilization {
       target = 0.7
     }
+  }
 
-    scale_in_control {
-      max_scaled_in_replicas {
-        fixed = 2
-      }
-      time_window_sec = 300
-    }
+  lifecycle {
+    ignore_changes = [
+      autoscaling_policy[0].mode,
+    ]
   }
 }
 

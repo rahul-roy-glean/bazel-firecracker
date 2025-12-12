@@ -15,31 +15,38 @@ const (
 	StateIdle         State = "idle"
 	StateBusy         State = "busy"
 	StateDraining     State = "draining"
+	StateQuarantined  State = "quarantined"
 	StateRetiring     State = "retiring"
 	StateTerminated   State = "terminated"
 )
 
 // Runner represents a single Bazel runner instance
 type Runner struct {
-	ID              string
-	HostID          string
-	State           State
-	InternalIP      net.IP
-	TapDevice       string
-	MAC             string
-	SnapshotVersion string
-	GitHubRunnerID  string
-	JobID           string
-	Resources       Resources
-	CreatedAt       time.Time
-	StartedAt       time.Time
-	CompletedAt     time.Time
-	LastHeartbeat   time.Time
-	SocketPath      string
-	LogPath         string
-	MetricsPath     string
-	RootfsOverlay   string
-	RepoCacheUpper  string
+	ID                      string
+	HostID                  string
+	State                   State
+	InternalIP              net.IP
+	TapDevice               string
+	MAC                     string
+	SnapshotVersion         string
+	GitHubRunnerID          string
+	JobID                   string
+	Resources               Resources
+	CreatedAt               time.Time
+	StartedAt               time.Time
+	CompletedAt             time.Time
+	LastHeartbeat           time.Time
+	SocketPath              string
+	LogPath                 string
+	MetricsPath             string
+	RootfsOverlay           string
+	RepoCacheUpper          string
+	QuarantineReason        string
+	QuarantinedAt           time.Time
+	QuarantineDir           string
+	PreQuarantineState      State
+	QuarantineEgressBlocked bool
+	QuarantinePaused        bool
 }
 
 // Resources represents the resources allocated to a runner
@@ -120,11 +127,14 @@ type HostConfig struct {
 	BuildbarnCertsMountPath string
 	// BuildbarnCertsImageSizeMB controls the size of the generated ext4 image.
 	BuildbarnCertsImageSizeMB int
-	MicroVMSubnet             string
-	ExternalInterface         string
-	BridgeName                string
-	Environment               string
-	ControlPlaneAddr          string
+	// QuarantineDir is where the host will write quarantine manifests and keep
+	// per-runner debug metadata when a runner is quarantined.
+	QuarantineDir     string
+	MicroVMSubnet     string
+	ExternalInterface string
+	BridgeName        string
+	Environment       string
+	ControlPlaneAddr  string
 }
 
 // DefaultHostConfig returns a host config with sensible defaults
@@ -142,6 +152,7 @@ func DefaultHostConfig() HostConfig {
 		RepoCacheUpperSizeGB:      10,
 		BuildbarnCertsMountPath:   "/etc/bazel-firecracker/certs/buildbarn",
 		BuildbarnCertsImageSizeMB: 32,
+		QuarantineDir:             "/mnt/nvme/quarantine",
 		MicroVMSubnet:             "172.16.0.0/24",
 		ExternalInterface:         "eth0",
 		BridgeName:                "fcbr0",

@@ -2,7 +2,9 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +31,17 @@ type Manager struct {
 	buildbarnCertsImage string
 	mu                  sync.RWMutex
 	logger              *logrus.Entry
+}
+
+type QuarantineOptions struct {
+	Reason      string
+	BlockEgress *bool
+	PauseVM     *bool
+}
+
+type UnquarantineOptions struct {
+	UnblockEgress *bool
+	ResumeVM      *bool
 }
 
 // NewManager creates a new runner manager
@@ -271,6 +284,13 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 		return fmt.Errorf("runner not found: %s", runnerID)
 	}
 
+	if runner.State == StateQuarantined {
+		if destroy {
+			return fmt.Errorf("runner %s is quarantined; unquarantine before destroying", runnerID)
+		}
+		return nil
+	}
+
 	m.logger.WithFields(logrus.Fields{
 		"runner_id": runnerID,
 		"destroy":   destroy,
@@ -286,6 +306,242 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 	delete(m.runners, runnerID)
 
 	return nil
+}
+
+type quarantineManifest struct {
+	RunnerID             string    `json:"runner_id"`
+	HostID               string    `json:"host_id"`
+	QuarantinedAt        time.Time `json:"quarantined_at"`
+	Reason               string    `json:"reason,omitempty"`
+	PreQuarantineState   State     `json:"pre_quarantine_state"`
+	InternalIP           string    `json:"internal_ip"`
+	TapDevice            string    `json:"tap_device"`
+	SocketPath           string    `json:"socket_path"`
+	LogPath              string    `json:"log_path"`
+	MetricsPath          string    `json:"metrics_path"`
+	RootfsOverlay        string    `json:"rootfs_overlay"`
+	RepoCacheUpper       string    `json:"repo_cache_upper"`
+	SnapshotVersion      string    `json:"snapshot_version"`
+	BlockEgressRequested bool      `json:"block_egress_requested"`
+	PauseVMRequested     bool      `json:"pause_vm_requested"`
+	EgressBlocked        bool      `json:"egress_blocked"`
+	Paused               bool      `json:"paused"`
+}
+
+func (m *Manager) QuarantineRunner(ctx context.Context, runnerID string, opts QuarantineOptions) (string, error) {
+	blockEgress := true
+	if opts.BlockEgress != nil {
+		blockEgress = *opts.BlockEgress
+	}
+	pauseVM := true
+	if opts.PauseVM != nil {
+		pauseVM = *opts.PauseVM
+	}
+
+	m.mu.Lock()
+	r, ok := m.runners[runnerID]
+	if !ok {
+		m.mu.Unlock()
+		return "", fmt.Errorf("runner not found: %s", runnerID)
+	}
+	if r.State == StateQuarantined {
+		dir := r.QuarantineDir
+		m.mu.Unlock()
+		return dir, nil
+	}
+	vm := m.vms[runnerID]
+	prevState := r.State
+	now := time.Now()
+	quarantineDir := filepath.Join(m.config.QuarantineDir, runnerID)
+	r.PreQuarantineState = prevState
+	r.State = StateQuarantined
+	r.QuarantineReason = opts.Reason
+	r.QuarantinedAt = now
+	r.QuarantineDir = quarantineDir
+	ip := append([]byte(nil), r.InternalIP...)
+	tapName := r.TapDevice
+	socketPath := r.SocketPath
+	logPath := r.LogPath
+	metricsPath := r.MetricsPath
+	rootfsOverlay := r.RootfsOverlay
+	repoCacheUpper := r.RepoCacheUpper
+	snapshotVersion := r.SnapshotVersion
+	m.mu.Unlock()
+
+	if err := os.MkdirAll(quarantineDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create quarantine dir: %w", err)
+	}
+
+	_ = os.Symlink(logPath, filepath.Join(quarantineDir, "runner.log"))
+	_ = os.Symlink(metricsPath, filepath.Join(quarantineDir, "runner.metrics"))
+	_ = os.Symlink(rootfsOverlay, filepath.Join(quarantineDir, "rootfs-overlay.img"))
+	_ = os.Symlink(repoCacheUpper, filepath.Join(quarantineDir, "repo-cache-upper.img"))
+
+	var errs []error
+	egressBlocked := false
+	if blockEgress {
+		if err := m.network.BlockEgress(net.IP(ip)); err != nil {
+			errs = append(errs, fmt.Errorf("block egress: %w", err))
+		} else {
+			egressBlocked = true
+		}
+	}
+
+	paused := false
+	if pauseVM {
+		if vm == nil {
+			errs = append(errs, fmt.Errorf("pause vm: VM not found"))
+		} else if err := vm.Pause(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("pause vm: %w", err))
+		} else {
+			paused = true
+		}
+	}
+
+	manifest := quarantineManifest{
+		RunnerID:             runnerID,
+		HostID:               m.config.HostID,
+		QuarantinedAt:        now,
+		Reason:               opts.Reason,
+		PreQuarantineState:   prevState,
+		InternalIP:           net.IP(ip).String(),
+		TapDevice:            tapName,
+		SocketPath:           socketPath,
+		LogPath:              logPath,
+		MetricsPath:          metricsPath,
+		RootfsOverlay:        rootfsOverlay,
+		RepoCacheUpper:       repoCacheUpper,
+		SnapshotVersion:      snapshotVersion,
+		BlockEgressRequested: blockEgress,
+		PauseVMRequested:     pauseVM,
+		EgressBlocked:        egressBlocked,
+		Paused:               paused,
+	}
+	_ = writeJSON(filepath.Join(quarantineDir, "manifest.json"), manifest)
+
+	m.mu.Lock()
+	if rr, ok := m.runners[runnerID]; ok {
+		rr.QuarantineEgressBlocked = egressBlocked
+		rr.QuarantinePaused = paused
+	}
+	m.mu.Unlock()
+
+	if len(errs) > 0 {
+		return quarantineDir, joinErrors(errs)
+	}
+	return quarantineDir, nil
+}
+
+func (m *Manager) UnquarantineRunner(ctx context.Context, runnerID string, opts UnquarantineOptions) error {
+	unblockEgress := true
+	if opts.UnblockEgress != nil {
+		unblockEgress = *opts.UnblockEgress
+	}
+	resumeVM := true
+	if opts.ResumeVM != nil {
+		resumeVM = *opts.ResumeVM
+	}
+
+	m.mu.Lock()
+	r, ok := m.runners[runnerID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("runner not found: %s", runnerID)
+	}
+	if r.State != StateQuarantined {
+		m.mu.Unlock()
+		return fmt.Errorf("runner %s is not quarantined", runnerID)
+	}
+	vm := m.vms[runnerID]
+	ip := append([]byte(nil), r.InternalIP...)
+	prevState := r.PreQuarantineState
+	egressWasBlocked := r.QuarantineEgressBlocked
+	wasPaused := r.QuarantinePaused
+	quarantineDir := r.QuarantineDir
+	m.mu.Unlock()
+
+	var errs []error
+	unblocked := false
+	if unblockEgress && egressWasBlocked {
+		if err := m.network.UnblockEgress(net.IP(ip)); err != nil {
+			errs = append(errs, fmt.Errorf("unblock egress: %w", err))
+		} else {
+			unblocked = true
+		}
+	}
+
+	resumed := false
+	if resumeVM && wasPaused {
+		if vm == nil {
+			errs = append(errs, fmt.Errorf("resume vm: VM not found"))
+		} else if err := vm.Resume(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("resume vm: %w", err))
+		} else {
+			resumed = true
+		}
+	}
+
+	m.mu.Lock()
+	if rr, ok := m.runners[runnerID]; ok {
+		if unblocked {
+			rr.QuarantineEgressBlocked = false
+		}
+		if resumed {
+			rr.QuarantinePaused = false
+		}
+		if len(errs) == 0 {
+			if prevState == "" {
+				prevState = StateIdle
+			}
+			rr.State = prevState
+		}
+	}
+	m.mu.Unlock()
+
+	if quarantineDir != "" {
+		_ = writeJSON(filepath.Join(quarantineDir, "unquarantine.json"), map[string]any{
+			"runner_id":        runnerID,
+			"unquarantined_at": time.Now(),
+			"unblock_egress":   unblockEgress,
+			"resume_vm":        resumeVM,
+			"errors":           errorsToStrings(errs),
+		})
+	}
+
+	if len(errs) > 0 {
+		return joinErrors(errs)
+	}
+	return nil
+}
+
+func writeJSON(path string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0644)
+}
+
+func joinErrors(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	msg := "errors:"
+	for _, err := range errs {
+		msg += " " + err.Error() + ";"
+	}
+	return fmt.Errorf("%s", msg)
+}
+
+func errorsToStrings(errs []error) []string {
+	if len(errs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(errs))
+	for _, err := range errs {
+		out = append(out, err.Error())
+	}
+	return out
 }
 
 // cleanupRunner cleans up runner resources

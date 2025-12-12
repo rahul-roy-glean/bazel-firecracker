@@ -159,6 +159,62 @@ func (s *HostAgentServer) GetRunner(ctx context.Context, req *GetRunnerRequest) 
 	return runnerToProto(r), nil
 }
 
+func (s *HostAgentServer) QuarantineRunner(ctx context.Context, req *QuarantineRunnerRequest) (*QuarantineRunnerResponse, error) {
+	s.logger.WithFields(logrus.Fields{
+		"runner_id":    req.RunnerId,
+		"block_egress": req.BlockEgress,
+		"pause_vm":     req.PauseVm,
+	}).Info("QuarantineRunner request")
+
+	var blockEgress *bool
+	if req.BlockEgress {
+		v := true
+		blockEgress = &v
+	}
+	var pauseVM *bool
+	if req.PauseVm {
+		v := true
+		pauseVM = &v
+	}
+
+	dir, err := s.manager.QuarantineRunner(ctx, req.RunnerId, runner.QuarantineOptions{
+		Reason:      req.Reason,
+		BlockEgress: blockEgress,
+		PauseVM:     pauseVM,
+	})
+	if err != nil {
+		return &QuarantineRunnerResponse{Success: false, Error: err.Error()}, nil
+	}
+	return &QuarantineRunnerResponse{Success: true, QuarantineDir: dir}, nil
+}
+
+func (s *HostAgentServer) UnquarantineRunner(ctx context.Context, req *UnquarantineRunnerRequest) (*UnquarantineRunnerResponse, error) {
+	s.logger.WithFields(logrus.Fields{
+		"runner_id":      req.RunnerId,
+		"unblock_egress": req.UnblockEgress,
+		"resume_vm":      req.ResumeVm,
+	}).Info("UnquarantineRunner request")
+
+	var unblockEgress *bool
+	if req.UnblockEgress {
+		v := true
+		unblockEgress = &v
+	}
+	var resumeVM *bool
+	if req.ResumeVm {
+		v := true
+		resumeVM = &v
+	}
+
+	if err := s.manager.UnquarantineRunner(ctx, req.RunnerId, runner.UnquarantineOptions{
+		UnblockEgress: unblockEgress,
+		ResumeVM:      resumeVM,
+	}); err != nil {
+		return &UnquarantineRunnerResponse{Success: false, Error: err.Error()}, nil
+	}
+	return &UnquarantineRunnerResponse{Success: true}, nil
+}
+
 // runnerToProto converts a runner to protobuf
 func runnerToProto(r *runner.Runner) *Runner {
 	state := RunnerState_RUNNER_STATE_UNSPECIFIED
@@ -175,6 +231,8 @@ func runnerToProto(r *runner.Runner) *Runner {
 		state = RunnerState_RUNNER_STATE_BUSY
 	case runner.StateDraining:
 		state = RunnerState_RUNNER_STATE_DRAINING
+	case runner.StateQuarantined:
+		state = RunnerState_RUNNER_STATE_QUARANTINED
 	case runner.StateRetiring:
 		state = RunnerState_RUNNER_STATE_RETIRING
 	case runner.StateTerminated:
@@ -281,6 +339,30 @@ type GetRunnerRequest struct {
 	RunnerId string
 }
 
+type QuarantineRunnerRequest struct {
+	RunnerId    string
+	Reason      string
+	BlockEgress bool
+	PauseVm     bool
+}
+
+type QuarantineRunnerResponse struct {
+	Success       bool
+	Error         string
+	QuarantineDir string
+}
+
+type UnquarantineRunnerRequest struct {
+	RunnerId      string
+	UnblockEgress bool
+	ResumeVm      bool
+}
+
+type UnquarantineRunnerResponse struct {
+	Success bool
+	Error   string
+}
+
 type Runner struct {
 	Id              string
 	HostId          string
@@ -310,8 +392,9 @@ const (
 	RunnerState_RUNNER_STATE_IDLE         RunnerState = 4
 	RunnerState_RUNNER_STATE_BUSY         RunnerState = 5
 	RunnerState_RUNNER_STATE_DRAINING     RunnerState = 6
-	RunnerState_RUNNER_STATE_RETIRING     RunnerState = 7
-	RunnerState_RUNNER_STATE_TERMINATED   RunnerState = 8
+	RunnerState_RUNNER_STATE_QUARANTINED  RunnerState = 7
+	RunnerState_RUNNER_STATE_RETIRING     RunnerState = 8
+	RunnerState_RUNNER_STATE_TERMINATED   RunnerState = 9
 )
 
 type HostState int32
@@ -347,6 +430,12 @@ func (UnimplementedHostAgentServer) ListRunners(context.Context, *ListRunnersReq
 }
 func (UnimplementedHostAgentServer) GetRunner(context.Context, *GetRunnerRequest) (*Runner, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetRunner not implemented")
+}
+func (UnimplementedHostAgentServer) QuarantineRunner(context.Context, *QuarantineRunnerRequest) (*QuarantineRunnerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method QuarantineRunner not implemented")
+}
+func (UnimplementedHostAgentServer) UnquarantineRunner(context.Context, *UnquarantineRunnerRequest) (*UnquarantineRunnerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UnquarantineRunner not implemented")
 }
 
 // RegisterHostAgentServer registers the service

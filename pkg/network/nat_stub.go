@@ -73,8 +73,14 @@ func (n *NATNetwork) GetBridgeName() string {
 	return ""
 }
 
+func (n *NATNetwork) BlockEgress(_ net.IP) error {
+	return fmt.Errorf("NAT networking is only supported on Linux")
+}
+
+func (n *NATNetwork) UnblockEgress(_ net.IP) error {
+	return fmt.Errorf("NAT networking is only supported on Linux")
+}
+
 func (t *TapDevice) GetNetworkConfig() NetworkConfig {
 	return NetworkConfig{}
 }
-
-

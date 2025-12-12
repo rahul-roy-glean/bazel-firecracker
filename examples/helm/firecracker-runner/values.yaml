@@ -1,0 +1,62 @@
+namespace:
+  create: true
+  name: firecracker-runner
+
+image:
+  # Example:
+  # repository: gcr.io/<PROJECT_ID>/firecracker-control-plane
+  repository: gcr.io/PROJECT_ID/firecracker-control-plane
+  tag: latest
+
+serviceAccount:
+  create: true
+  annotations:
+    # GKE Workload Identity: map KSA -> GSA
+    # Replace PROJECT_ID and ENV as needed.
+    iam.gke.io/gcp-service-account: firecracker-runner-ENV-control-plane@PROJECT_ID.iam.gserviceaccount.com
+
+config:
+  # Snapshot artifacts bucket (created by Terraform).
+  # Example: <PROJECT_ID>-firecracker-snapshots
+  gcsBucket: PROJECT_ID-firecracker-snapshots
+
+env:
+  db:
+    secretName: db-credentials
+    hostKey: host
+    usernameKey: username
+    passwordKey: password
+    name: firecracker_runner
+    sslMode: require
+
+  github:
+    secretName: github-credentials
+    webhookSecretKey: webhook_secret
+
+ingress:
+  enabled: true
+  className: gce
+  annotations:
+    # Optional: set a static IP name if you manage one.
+    # kubernetes.io/ingress.global-static-ip-name: firecracker-control-plane-ip
+    cloud.google.com/neg: '{"ingress": true}'
+  hosts:
+    - host: runners.example.com
+      paths:
+        - path: /webhook
+          pathType: Prefix
+        - path: /api
+          pathType: Prefix
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+

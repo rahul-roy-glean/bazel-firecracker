@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" width="220" alt="bazel-firecracker logo" />
+</p>
+
 # Firecracker-based Bazel Runner Platform
 
 A high-performance GitHub Actions runner platform using Firecracker microVMs on GCP, optimized for Bazel builds with Buildbarn (REv2) remote cache and pre-warmed snapshots.

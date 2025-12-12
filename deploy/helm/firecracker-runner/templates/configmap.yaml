@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "firecracker-runner.fullname" . }}-config
+  namespace: {{ include "firecracker-runner.namespace" . }}
+  labels:
+{{ include "firecracker-runner.labels" . | indent 4 }}
+data:
+  gcs_bucket: {{ .Values.config.gcsBucket | quote }}
+  config.yaml: |
+{{ .Values.config.configYaml | indent 4 }}
+
+

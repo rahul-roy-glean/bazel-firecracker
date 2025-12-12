@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "firecracker-runner.fullname" . }}
+  namespace: {{ include "firecracker-runner.namespace" . }}
+  labels:
+{{ include "firecracker-runner.labels" . | indent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+{{ include "firecracker-runner.selectorLabels" . | indent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "firecracker-runner.selectorLabels" . | indent 8 }}
+{{- with .Values.podLabels }}
+{{ toYaml . | indent 8 }}
+{{- end }}
+{{- with .Values.podAnnotations }}
+      annotations:
+{{ toYaml . | indent 8 }}
+{{- end }}
+    spec:
+      serviceAccountName: {{ include "firecracker-runner.serviceAccountName" . }}
+      containers:
+        - name: control-plane
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.ports.grpc }}
+            - name: http
+              containerPort: {{ .Values.service.ports.http }}
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.env.db.secretName }}
+                  key: {{ .Values.env.db.hostKey }}
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.env.db.secretName }}
+                  key: {{ .Values.env.db.usernameKey }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.env.db.secretName }}
+                  key: {{ .Values.env.db.passwordKey }}
+            - name: DB_NAME
+              value: {{ .Values.env.db.name | quote }}
+            - name: DB_SSL_MODE
+              value: {{ .Values.env.db.sslMode | quote }}
+            - name: GCS_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "firecracker-runner.fullname" . }}-config
+                  key: gcs_bucket
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.env.github.secretName }}
+                  key: {{ .Values.env.github.webhookSecretKey }}
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/control-plane
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "firecracker-runner.fullname" . }}-config
+
+

@@ -1,0 +1,117 @@
+nameOverride: ""
+fullnameOverride: ""
+
+namespace:
+  create: false
+  name: firecracker-runner
+
+image:
+  repository: gcr.io/your-project-id/firecracker-control-plane
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # Example (GKE Workload Identity):
+  # annotations:
+  #   iam.gke.io/gcp-service-account: firecracker-runner-dev-control-plane@your-project-id.iam.gserviceaccount.com
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+podLabels: {}
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+securityContext: {}
+containerSecurityContext: {}
+
+config:
+  # Used by the control plane for snapshot versioning/artifacts.
+  gcsBucket: your-project-id-firecracker-snapshots
+
+  # Optional: used for future config expansion; control-plane currently reads env vars.
+  configYaml: |
+    grpc_port: 50051
+    http_port: 8080
+    log_level: info
+
+    scheduler:
+      idle_target: 2
+      max_queue_depth: 100
+
+    snapshot:
+      freshness_check_interval: 1h
+      max_age: 24h
+      canary_percentage: 10
+
+env:
+  # Database connection (via Secret)
+  db:
+    secretName: db-credentials
+    hostKey: host
+    usernameKey: username
+    passwordKey: password
+    name: firecracker_runner
+    sslMode: require
+
+  github:
+    secretName: github-credentials
+    webhookSecretKey: webhook_secret
+
+service:
+  type: ClusterIP
+  ports:
+    grpc: 50051
+    http: 8080
+
+ingress:
+  enabled: false
+  className: gce
+  annotations: {}
+  # Example:
+  # annotations:
+  #   kubernetes.io/ingress.global-static-ip-name: firecracker-control-plane-ip
+  hosts:
+    - host: runners.example.com
+      paths:
+        - path: /webhook
+          pathType: Prefix
+        - path: /api
+          pathType: Prefix
+  tls: []
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+monitoring:
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    labels: {}
+
+  prometheusRule:
+    enabled: false
+    labels: {}
+
+

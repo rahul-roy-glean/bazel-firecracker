@@ -1,0 +1,26 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "firecracker-runner.fullname" . }}
+  namespace: {{ include "firecracker-runner.namespace" . }}
+  labels:
+{{ include "firecracker-runner.labels" . | indent 4 }}
+{{- with .Values.monitoring.prometheusRule.labels }}
+{{ toYaml . | indent 4 }}
+{{- end }}
+spec:
+  groups:
+    - name: firecracker-runner-control-plane
+      rules:
+        - alert: FirecrackerControlPlaneDown
+          expr: up{job=~".*control-plane.*"} == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Firecracker control-plane is down"
+            description: "No control-plane targets are up for 2 minutes"
+{{- end }}
+
+

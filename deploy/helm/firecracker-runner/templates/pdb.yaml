@@ -1,0 +1,16 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "firecracker-runner.fullname" . }}
+  namespace: {{ include "firecracker-runner.namespace" . }}
+  labels:
+{{ include "firecracker-runner.labels" . | indent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+{{ include "firecracker-runner.selectorLabels" . | indent 6 }}
+{{- end }}
+
+

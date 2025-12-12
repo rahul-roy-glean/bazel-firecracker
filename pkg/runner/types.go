@@ -68,6 +68,11 @@ type MMDSData struct {
 			HostID      string `json:"host_id"`
 			Environment string `json:"environment"`
 		} `json:"meta"`
+		Buildbarn struct {
+			// CertsMountPath is where Buildbarn mTLS certs will be mounted inside the microVM.
+			// Some existing setups use /etc/glean/ci/certs; this is configurable.
+			CertsMountPath string `json:"certs_mount_path,omitempty"`
+		} `json:"buildbarn,omitempty"`
 		Network struct {
 			IP        string `json:"ip"`
 			Gateway   string `json:"gateway"`
@@ -107,29 +112,39 @@ type HostConfig struct {
 	// RepoCacheUpperSizeGB controls the per-runner writable layer size for the
 	// Bazel repository cache overlay.
 	RepoCacheUpperSizeGB int
-	MicroVMSubnet        string
-	ExternalInterface    string
-	BridgeName           string
-	Environment          string
-	ControlPlaneAddr     string
+	// BuildbarnCertsDir is a host directory containing Buildbarn certificates
+	// (e.g. ca.crt, client.crt, client.pem). If set, the host agent will package
+	// this directory into an ext4 image and attach it read-only to each microVM.
+	BuildbarnCertsDir string
+	// BuildbarnCertsMountPath is where the certs will be mounted inside the microVM.
+	BuildbarnCertsMountPath string
+	// BuildbarnCertsImageSizeMB controls the size of the generated ext4 image.
+	BuildbarnCertsImageSizeMB int
+	MicroVMSubnet             string
+	ExternalInterface         string
+	BridgeName                string
+	Environment               string
+	ControlPlaneAddr          string
 }
 
 // DefaultHostConfig returns a host config with sensible defaults
 func DefaultHostConfig() HostConfig {
 	return HostConfig{
-		MaxRunners:           16,
-		IdleTarget:           2,
-		VCPUsPerRunner:       4,
-		MemoryMBPerRunner:    8192,
-		FirecrackerBin:       "/usr/local/bin/firecracker",
-		SocketDir:            "/var/run/firecracker",
-		WorkspaceDir:         "/mnt/nvme/workspaces",
-		LogDir:               "/var/log/firecracker",
-		SnapshotCachePath:    "/mnt/nvme/snapshots",
-		RepoCacheUpperSizeGB: 10,
-		MicroVMSubnet:        "172.16.0.0/24",
-		ExternalInterface:    "eth0",
-		BridgeName:           "fcbr0",
-		Environment:          "dev",
+		MaxRunners:                16,
+		IdleTarget:                2,
+		VCPUsPerRunner:            4,
+		MemoryMBPerRunner:         8192,
+		FirecrackerBin:            "/usr/local/bin/firecracker",
+		SocketDir:                 "/var/run/firecracker",
+		WorkspaceDir:              "/mnt/nvme/workspaces",
+		LogDir:                    "/var/log/firecracker",
+		SnapshotCachePath:         "/mnt/nvme/snapshots",
+		RepoCacheUpperSizeGB:      10,
+		BuildbarnCertsMountPath:   "/etc/bazel-firecracker/certs/buildbarn",
+		BuildbarnCertsImageSizeMB: 32,
+		MicroVMSubnet:             "172.16.0.0/24",
+		ExternalInterface:         "eth0",
+		BridgeName:                "fcbr0",
+		Environment:               "dev",
 	}
 }

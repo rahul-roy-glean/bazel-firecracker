@@ -36,6 +36,9 @@ var (
 	snapshotBucket       = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
 	snapshotCache        = flag.String("snapshot-cache", "/mnt/nvme/snapshots", "Local snapshot cache path")
 	repoCacheUpperSizeGB = flag.Int("repo-cache-upper-size-gb", 10, "Size in GB of the per-runner repo cache writable layer (upper)")
+	buildbarnCertsDir    = flag.String("buildbarn-certs-dir", "", "Host directory containing Buildbarn certs to mount into microVMs (e.g. /etc/glean/ci/certs)")
+	buildbarnCertsMount  = flag.String("buildbarn-certs-mount", "/etc/bazel-firecracker/certs/buildbarn", "Guest mount path for Buildbarn certs inside the microVM")
+	buildbarnCertsSizeMB = flag.Int("buildbarn-certs-image-size-mb", 32, "Size in MB of the generated Buildbarn certs ext4 image")
 	microVMSubnet        = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
 	extInterface         = flag.String("ext-interface", "eth0", "External network interface")
 	bridgeName           = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
@@ -77,25 +80,28 @@ func main() {
 
 	// Create runner manager config
 	cfg := runner.HostConfig{
-		HostID:               hostID,
-		InstanceName:         instanceName,
-		Zone:                 zone,
-		MaxRunners:           *maxRunners,
-		IdleTarget:           *idleTarget,
-		VCPUsPerRunner:       *vcpusPerRunner,
-		MemoryMBPerRunner:    *memoryPerRunner,
-		FirecrackerBin:       *firecrackerBin,
-		SocketDir:            *socketDir,
-		WorkspaceDir:         *workspaceDir,
-		LogDir:               *logDir,
-		SnapshotBucket:       *snapshotBucket,
-		SnapshotCachePath:    *snapshotCache,
-		RepoCacheUpperSizeGB: *repoCacheUpperSizeGB,
-		MicroVMSubnet:        *microVMSubnet,
-		ExternalInterface:    *extInterface,
-		BridgeName:           *bridgeName,
-		Environment:          *environment,
-		ControlPlaneAddr:     *controlPlane,
+		HostID:                    hostID,
+		InstanceName:              instanceName,
+		Zone:                      zone,
+		MaxRunners:                *maxRunners,
+		IdleTarget:                *idleTarget,
+		VCPUsPerRunner:            *vcpusPerRunner,
+		MemoryMBPerRunner:         *memoryPerRunner,
+		FirecrackerBin:            *firecrackerBin,
+		SocketDir:                 *socketDir,
+		WorkspaceDir:              *workspaceDir,
+		LogDir:                    *logDir,
+		SnapshotBucket:            *snapshotBucket,
+		SnapshotCachePath:         *snapshotCache,
+		RepoCacheUpperSizeGB:      *repoCacheUpperSizeGB,
+		BuildbarnCertsDir:         *buildbarnCertsDir,
+		BuildbarnCertsMountPath:   *buildbarnCertsMount,
+		BuildbarnCertsImageSizeMB: *buildbarnCertsSizeMB,
+		MicroVMSubnet:             *microVMSubnet,
+		ExternalInterface:         *extInterface,
+		BridgeName:                *bridgeName,
+		Environment:               *environment,
+		ControlPlaneAddr:          *controlPlane,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

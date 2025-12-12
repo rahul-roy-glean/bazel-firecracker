@@ -26,11 +26,15 @@ var (
 	skipGitSync            = flag.Bool("skip-git-sync", false, "Skip git sync")
 	skipRunner             = flag.Bool("skip-runner", false, "Skip GitHub runner registration")
 	skipRepoCache          = flag.Bool("skip-repo-cache", false, "Skip shared Bazel repository cache overlay setup")
+	skipBuildbarnCerts     = flag.Bool("skip-buildbarn-certs", false, "Skip mounting Buildbarn certificate drive")
 	repoCacheSeedDevice    = flag.String("repo-cache-seed-device", "/dev/vdb", "Block device for shared repo-cache seed (read-only mount inside VM)")
 	repoCacheUpperDevice   = flag.String("repo-cache-upper-device", "/dev/vdc", "Block device for per-runner repo-cache upper (writable mount inside VM)")
 	repoCacheSeedMount     = flag.String("repo-cache-seed-mount", "/mnt/bazel-repo-seed", "Mount point for repo-cache seed device")
 	repoCacheUpperMount    = flag.String("repo-cache-upper-mount", "/mnt/bazel-repo-upper", "Mount point for repo-cache upper device")
 	repoCacheOverlayTarget = flag.String("repo-cache-overlay-target", "/mnt/ephemeral/caches/repository", "Overlay mount target for Bazel --repository_cache")
+	buildbarnCertsDevice   = flag.String("buildbarn-certs-device", "/dev/vdd", "Block device for Buildbarn certs drive (read-only mount inside VM)")
+	buildbarnCertsMount    = flag.String("buildbarn-certs-mount", "/etc/bazel-firecracker/certs/buildbarn", "Mount point for Buildbarn certs inside the microVM")
+	buildbarnCertsLabel    = flag.String("buildbarn-certs-label", "BUILDBARN_CERTS", "Filesystem label for Buildbarn certs drive")
 )
 
 // MMDSData represents the data structure from MMDS
@@ -41,6 +45,9 @@ type MMDSData struct {
 			HostID      string `json:"host_id"`
 			Environment string `json:"environment"`
 		} `json:"meta"`
+		Buildbarn struct {
+			CertsMountPath string `json:"certs_mount_path,omitempty"`
+		} `json:"buildbarn,omitempty"`
 		Network struct {
 			IP        string `json:"ip"`
 			Gateway   string `json:"gateway"`
@@ -100,6 +107,14 @@ func main() {
 		log.Info("Setting up shared Bazel repository cache overlay...")
 		if err := setupRepoCacheOverlay(); err != nil {
 			log.WithError(err).Error("Failed to setup repo cache overlay")
+		}
+	}
+
+	// Mount Buildbarn certificate drive (shared read-only seed image packaged by host).
+	if !*skipBuildbarnCerts {
+		log.Info("Mounting Buildbarn certs...")
+		if err := mountBuildbarnCerts(mmdsData); err != nil {
+			log.WithError(err).Error("Failed to mount Buildbarn certs")
 		}
 	}
 
@@ -216,6 +231,34 @@ func setupRepoCacheOverlay() error {
 	return nil
 }
 
+func mountBuildbarnCerts(data *MMDSData) error {
+	mountPath := *buildbarnCertsMount
+	if data != nil && data.Latest.Buildbarn.CertsMountPath != "" {
+		mountPath = data.Latest.Buildbarn.CertsMountPath
+	}
+	if mountPath == "" {
+		return nil
+	}
+
+	if err := os.MkdirAll(mountPath, 0755); err != nil {
+		return fmt.Errorf("failed to create buildbarn certs mount dir: %w", err)
+	}
+
+	dev := resolveDevice(*buildbarnCertsDevice, *buildbarnCertsLabel)
+	if err := exec.Command("mountpoint", "-q", mountPath).Run(); err == nil {
+		return nil
+	}
+	if output, err := exec.Command("mount", "-o", "ro", dev, mountPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount failed: %s: %w", string(output), err)
+	}
+
+	log.WithFields(logrus.Fields{
+		"device": dev,
+		"mount":  mountPath,
+	}).Info("Buildbarn certs mounted")
+	return nil
+}
+
 func resolveDevice(defaultDev string, label string) string {
 	// Prefer by-label path if present.
 	byLabel := filepath.Join("/dev/disk/by-label", label)
@@ -271,6 +314,9 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					HostID      string `json:"host_id"`
 					Environment string `json:"environment"`
 				} `json:"meta"`
+				Buildbarn struct {
+					CertsMountPath string `json:"certs_mount_path,omitempty"`
+				} `json:"buildbarn,omitempty"`
 				Network struct {
 					IP        string `json:"ip"`
 					Gateway   string `json:"gateway"`

@@ -24,8 +24,11 @@ type Manager struct {
 	vms           map[string]*firecracker.VM
 	snapshotCache *snapshot.Cache
 	network       *network.NATNetwork
-	mu            sync.RWMutex
-	logger        *logrus.Entry
+	// buildbarnCertsImage is an ext4 image containing Buildbarn certs, attached
+	// read-only to each microVM for Bazel remote cache/execution TLS config.
+	buildbarnCertsImage string
+	mu                  sync.RWMutex
+	logger              *logrus.Entry
 }
 
 // NewManager creates a new runner manager
@@ -67,13 +70,19 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		}
 	}
 
+	buildbarnCertsImg, err := ensureBuildbarnCertsImage(cfg, logger.WithField("component", "runner-manager"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to prepare buildbarn certs image: %w", err)
+	}
+
 	return &Manager{
-		config:        cfg,
-		runners:       make(map[string]*Runner),
-		vms:           make(map[string]*firecracker.VM),
-		snapshotCache: cache,
-		network:       natNet,
-		logger:        logger.WithField("component", "runner-manager"),
+		config:              cfg,
+		runners:             make(map[string]*Runner),
+		vms:                 make(map[string]*firecracker.VM),
+		snapshotCache:       cache,
+		network:             natNet,
+		buildbarnCertsImage: buildbarnCertsImg,
+		logger:              logger.WithField("component", "runner-manager"),
 	}, nil
 }
 
@@ -173,6 +182,12 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 				IsRootDevice: false,
 				IsReadOnly:   false,
 			},
+			{
+				DriveID:      "buildbarn-certs",
+				PathOnHost:   m.buildbarnCertsImage,
+				IsRootDevice: false,
+				IsReadOnly:   true,
+			},
 		},
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
@@ -229,6 +244,7 @@ func (m *Manager) buildMMDSData(runner *Runner, tap *network.TapDevice, req Allo
 	data.Latest.Meta.RunnerID = runner.ID
 	data.Latest.Meta.HostID = m.config.HostID
 	data.Latest.Meta.Environment = m.config.Environment
+	data.Latest.Buildbarn.CertsMountPath = m.config.BuildbarnCertsMountPath
 	data.Latest.Network.IP = netCfg.IP
 	data.Latest.Network.Gateway = netCfg.Gateway
 	data.Latest.Network.Netmask = netCfg.Netmask
@@ -301,6 +317,97 @@ func createExt4Image(path string, sizeGB int, label string) error {
 	}
 	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, path).CombinedOutput(); err != nil {
 		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+	}
+	return nil
+}
+
+func ensureBuildbarnCertsImage(cfg HostConfig, log *logrus.Entry) (string, error) {
+	sharedDir := filepath.Join(cfg.WorkspaceDir, "_shared")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create shared dir: %w", err)
+	}
+
+	imgPath := filepath.Join(sharedDir, "buildbarn-certs.img")
+	sizeMB := cfg.BuildbarnCertsImageSizeMB
+	if sizeMB <= 0 {
+		sizeMB = 32
+	}
+
+	seedDir := cfg.BuildbarnCertsDir
+	if seedDir == "" {
+		// Ensure a placeholder image exists so the snapshot device layout is always satisfied.
+		if _, err := os.Stat(imgPath); err == nil {
+			return imgPath, nil
+		}
+		if err := createExt4ImageMB(imgPath, sizeMB, "BUILDBARN_CERTS"); err != nil {
+			return "", err
+		}
+		_ = os.Chmod(imgPath, 0600)
+		return imgPath, nil
+	}
+
+	// Rebuild on manager startup so rotations in the source directory are picked up.
+	if err := createExt4ImageMB(imgPath, sizeMB, "BUILDBARN_CERTS"); err != nil {
+		return "", err
+	}
+	if err := seedExt4ImageFromDir(imgPath, seedDir); err != nil {
+		if log != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				"seed_dir": seedDir,
+				"image":    imgPath,
+			}).Warn("Failed to seed buildbarn certs image; continuing with empty image")
+		}
+	}
+	_ = os.Chmod(imgPath, 0600)
+	return imgPath, nil
+}
+
+func createExt4ImageMB(path string, sizeMB int, label string) error {
+	if sizeMB <= 0 {
+		return fmt.Errorf("invalid sizeMB: %d", sizeMB)
+	}
+	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dM", sizeMB), path).Run(); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
+	}
+	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, path).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+	}
+	return nil
+}
+
+func seedExt4ImageFromDir(imgPath, seedDir string) error {
+	info, err := os.Stat(seedDir)
+	if err != nil {
+		return fmt.Errorf("seed dir stat failed: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("seed dir is not a directory: %s", seedDir)
+	}
+
+	mountPoint := filepath.Join(filepath.Dir(imgPath), "mnt-buildbarn-certs")
+	if err := os.MkdirAll(mountPoint, 0755); err != nil {
+		return fmt.Errorf("failed to create mount point: %w", err)
+	}
+	defer os.RemoveAll(mountPoint)
+
+	if output, err := exec.Command("mount", "-o", "loop", imgPath, mountPoint).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount loop failed: %s: %w", string(output), err)
+	}
+	defer func() {
+		_ = exec.Command("umount", mountPoint).Run()
+	}()
+
+	if _, err := exec.LookPath("rsync"); err == nil {
+		cmd := exec.Command("rsync", "-a", "--delete", seedDir+string(os.PathSeparator), mountPoint+string(os.PathSeparator))
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("rsync failed: %s: %w", string(output), err)
+		}
+		return nil
+	}
+
+	cmd := exec.Command("cp", "-a", seedDir+string(os.PathSeparator)+".", mountPoint+string(os.PathSeparator))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("cp -a failed: %s: %w", string(output), err)
 	}
 	return nil
 }

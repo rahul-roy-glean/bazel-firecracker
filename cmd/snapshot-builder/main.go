@@ -98,6 +98,14 @@ func main() {
 		log.WithError(err).Fatal("Failed to create repo-cache upper image")
 	}
 
+	// Create a placeholder Buildbarn certs image so the snapshot includes the same
+	// device layout (drive ID) as the restore path. Hosts may override the backing
+	// file at restore time with an image built from secret material.
+	buildbarnCertsImg := filepath.Join(*outputDir, "buildbarn-certs.img")
+	if err := createExt4ImageMB(buildbarnCertsImg, 32, "BUILDBARN_CERTS"); err != nil {
+		log.WithError(err).Fatal("Failed to create buildbarn-certs image")
+	}
+
 	// Create VM for warmup
 	vmID := "snapshot-builder"
 	socketPath := filepath.Join(*outputDir, "firecracker.sock")
@@ -123,6 +131,12 @@ func main() {
 				PathOnHost:   repoCacheUpperImg,
 				IsRootDevice: false,
 				IsReadOnly:   false,
+			},
+			{
+				DriveID:      "buildbarn-certs",
+				PathOnHost:   buildbarnCertsImg,
+				IsRootDevice: false,
+				IsReadOnly:   true,
 			},
 		},
 	}
@@ -258,6 +272,20 @@ func createExt4Image(path string, sizeGB int, label string) error {
 		return fmt.Errorf("invalid sizeGB: %d", sizeGB)
 	}
 	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", sizeGB), path).Run(); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
+	}
+	// mkfs.ext4 works on regular files with -F
+	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, path).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+	}
+	return nil
+}
+
+func createExt4ImageMB(path string, sizeMB int, label string) error {
+	if sizeMB <= 0 {
+		return fmt.Errorf("invalid sizeMB: %d", sizeMB)
+	}
+	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dM", sizeMB), path).Run(); err != nil {
 		return fmt.Errorf("truncate failed: %w", err)
 	}
 	// mkfs.ext4 works on regular files with -F

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package runner;
 
-option go_package = "github.com/anthropic/bazel-firecracker/api/proto/runner";
+option go_package = "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner";
 
 import "google/protobuf/timestamp.proto";
 

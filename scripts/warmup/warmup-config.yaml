@@ -14,14 +14,22 @@ bazel:
   
   # Cache settings
   disk_cache: "/home/runner/.cache/bazel-disk"
-  repository_cache: "/home/runner/.cache/bazel-repo"
+  repository_cache: "/mnt/ephemeral/caches/repository"
   
   # Memory settings
   max_heap_size: "4g"
   
   # Additional bazelrc content
   extra_config: |
-    build --remote_cache=grpcs://your-remote-cache.example.com
+    # Buildbarn (REv2) example. Choose ONE approach:
+    # 1) Direct to buildbarn frontend:
+    #    build --remote_cache=grpcs://${BUILDBARN_FRONTEND}:8980
+    #
+    # 2) Via bb_clientd on the runner host:
+    #    build --remote_cache=unix:///mnt/ephemeral/buildbarn/.cache/bb_clientd/grpc
+    #    build --remote_bytestream_uri_prefix=${BUILDBARN_FRONTEND}:8980
+    #
+    # Then tune upload/download behavior as desired:
     build --remote_upload_local_results=false
 
 # Warmup targets

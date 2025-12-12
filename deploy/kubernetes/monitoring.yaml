@@ -44,9 +44,11 @@ data:
       # Host agent metrics (via federation or push gateway)
       - job_name: 'firecracker-hosts'
         gce_sd_configs:
-        - project: PROJECT_ID
-          zone: us-central1-a
-          filter: 'labels.firecracker-host=true'
+        - project: ${PROJECT_ID}
+          zone: ${ZONE}
+          # Filter to only include Firecracker host VMs. Update this to match your
+          # deployment (tags, labels, instance group name, etc).
+          filter: 'tags.items=firecracker-host'
           port: 9090
         relabel_configs:
         - source_labels: [__meta_gce_instance_name]

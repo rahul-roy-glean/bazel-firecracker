@@ -12,9 +12,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
-	"github.com/anthropic/bazel-firecracker/pkg/firecracker"
-	"github.com/anthropic/bazel-firecracker/pkg/network"
-	"github.com/anthropic/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 // Manager manages the lifecycle of runners on a host

@@ -11,8 +11,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/anthropic/bazel-firecracker/pkg/firecracker"
-	"github.com/anthropic/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 var (

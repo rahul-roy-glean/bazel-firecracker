@@ -12,7 +12,9 @@ metadata:
   name: control-plane
   namespace: firecracker-runner
   annotations:
-    iam.gke.io/gcp-service-account: fc-runner-dev-control-plane@PROJECT_ID.iam.gserviceaccount.com
+    # Replace with the GCP service account email created by Terraform (Workload Identity).
+    # Example (env=dev): firecracker-runner-dev-control-plane@${PROJECT_ID}.iam.gserviceaccount.com
+    iam.gke.io/gcp-service-account: firecracker-runner-dev-control-plane@${PROJECT_ID}.iam.gserviceaccount.com
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -20,6 +22,8 @@ metadata:
   name: control-plane-config
   namespace: firecracker-runner
 data:
+  # Snapshot bucket created by Terraform.
+  gcs_bucket: ${PROJECT_ID}-firecracker-snapshots
   config.yaml: |
     grpc_port: 50051
     http_port: 8080
@@ -58,7 +62,7 @@ spec:
       serviceAccountName: control-plane
       containers:
       - name: control-plane
-        image: gcr.io/PROJECT_ID/firecracker-control-plane:latest
+        image: gcr.io/${PROJECT_ID}/firecracker-control-plane:latest
         ports:
         - name: grpc
           containerPort: 50051
@@ -168,7 +172,7 @@ metadata:
     kubernetes.io/ingress.global-static-ip-name: firecracker-control-plane-ip
 spec:
   rules:
-  - host: runners.example.com
+  - host: ${CONTROL_PLANE_DOMAIN}
     http:
       paths:
       - path: /webhook/*

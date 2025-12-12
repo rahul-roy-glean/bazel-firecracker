@@ -1,6 +1,6 @@
 # Firecracker-based Bazel Runner Platform
 
-A high-performance CI runner platform using Firecracker microVMs on GCP, optimized for Bazel builds with pre-warmed snapshots.
+A high-performance GitHub Actions runner platform using Firecracker microVMs on GCP, optimized for Bazel builds with Buildbarn (REv2) remote cache and pre-warmed snapshots.
 
 ## Overview
 
@@ -117,7 +117,7 @@ make docker-build PROJECT_ID=$PROJECT_ID
 make docker-push PROJECT_ID=$PROJECT_ID
 
 # Deploy to GKE
-gcloud container clusters get-credentials fc-runner-dev-control-plane --region us-central1
+gcloud container clusters get-credentials firecracker-runner-dev-control-plane --region us-central1 --project "$PROJECT_ID"
 kubectl apply -f deploy/kubernetes/
 ```
 

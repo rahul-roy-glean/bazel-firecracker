@@ -18,8 +18,8 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
-	"github.com/anthropic/bazel-firecracker/pkg/metrics"
-	"github.com/anthropic/bazel-firecracker/pkg/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 )
 
 var (

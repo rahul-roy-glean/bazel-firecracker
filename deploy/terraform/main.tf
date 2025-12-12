@@ -30,7 +30,7 @@ provider "google-beta" {
 }
 
 locals {
-  name_prefix = "fc-runner-${var.environment}"
+  name_prefix = "firecracker-runner-${var.environment}"
 
   labels = {
     environment = var.environment

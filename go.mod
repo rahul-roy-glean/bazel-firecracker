@@ -1,4 +1,4 @@
-module github.com/anthropic/bazel-firecracker
+module github.com/rahul-roy-glean/bazel-firecracker
 
 go 1.22
 

@@ -194,23 +194,21 @@ func (s *Scheduler) GetStats() SchedulerStats {
 	}
 
 	return SchedulerStats{
-		TotalHosts:    len(hosts),
-		TotalSlots:    totalSlots,
-		UsedSlots:     usedSlots,
-		IdleRunners:   idleRunners,
-		BusyRunners:   busyRunners,
-		QueueDepth:    s.GetQueueDepth(),
+		TotalHosts:  len(hosts),
+		TotalSlots:  totalSlots,
+		UsedSlots:   usedSlots,
+		IdleRunners: idleRunners,
+		BusyRunners: busyRunners,
+		QueueDepth:  s.GetQueueDepth(),
 	}
 }
 
 // SchedulerStats holds scheduler statistics
 type SchedulerStats struct {
-	TotalHosts    int
-	TotalSlots    int
-	UsedSlots     int
-	IdleRunners   int
-	BusyRunners   int
-	QueueDepth    int
+	TotalHosts  int
+	TotalSlots  int
+	UsedSlots   int
+	IdleRunners int
+	BusyRunners int
+	QueueDepth  int
 }
-
-

@@ -150,6 +150,18 @@ resource "google_project_iam_member" "control_plane_compute" {
   member  = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
+resource "google_project_iam_member" "control_plane_mig_admin" {
+  project = var.project_id
+  role    = "roles/compute.instanceGroupManagerAdmin"
+  member  = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
+resource "google_project_iam_member" "control_plane_instance_admin" {
+  project = var.project_id
+  role    = "roles/compute.instanceAdmin.v1"
+  member  = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
 resource "google_project_iam_member" "control_plane_sql" {
   project = var.project_id
   role    = "roles/cloudsql.client"

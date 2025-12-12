@@ -50,6 +50,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     snapshot-bucket = google_storage_bucket.snapshots.name
     microvm-subnet  = var.microvm_subnet
     environment     = var.environment
+    control-plane   = var.control_plane_addr
   }
 
   metadata_startup_script = <<-EOF

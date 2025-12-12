@@ -29,6 +29,7 @@ type Manager struct {
 	// buildbarnCertsImage is an ext4 image containing Buildbarn certs, attached
 	// read-only to each microVM for Bazel remote cache/execution TLS config.
 	buildbarnCertsImage string
+	draining            bool
 	mu                  sync.RWMutex
 	logger              *logrus.Entry
 }
@@ -99,10 +100,30 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 	}, nil
 }
 
+func (m *Manager) IsDraining() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.draining
+}
+
+func (m *Manager) SetDraining(draining bool) (changed bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.draining == draining {
+		return false
+	}
+	m.draining = draining
+	return true
+}
+
 // AllocateRunner allocates a new runner
 func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Runner, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if m.draining {
+		return nil, fmt.Errorf("host is draining")
+	}
 
 	// Check capacity
 	if len(m.runners) >= m.config.MaxRunners {
@@ -731,6 +752,7 @@ func (m *Manager) GetStatus() ManagerStatus {
 		IdleRunners:     idle,
 		BusyRunners:     busy,
 		SnapshotVersion: m.snapshotCache.CurrentVersion(),
+		Draining:        m.draining,
 	}
 }
 
@@ -741,6 +763,7 @@ type ManagerStatus struct {
 	IdleRunners     int
 	BusyRunners     int
 	SnapshotVersion string
+	Draining        bool
 }
 
 // SyncSnapshot syncs a new snapshot version from GCS
@@ -753,7 +776,7 @@ func (m *Manager) SyncSnapshot(ctx context.Context, version string) error {
 func (m *Manager) CanAddRunner() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return len(m.runners) < m.config.MaxRunners
+	return !m.draining && len(m.runners) < m.config.MaxRunners
 }
 
 // IdleCount returns the number of idle runners
@@ -768,6 +791,29 @@ func (m *Manager) IdleCount() int {
 		}
 	}
 	return count
+}
+
+// DrainIdleRunners stops and removes all idle runners on the host. Busy runners
+// are left alone so in-flight jobs can finish.
+func (m *Manager) DrainIdleRunners(ctx context.Context) (int, error) {
+	ids := m.ListRunners(StateIdle)
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	var errs []error
+	stopped := 0
+	for _, r := range ids {
+		if err := m.ReleaseRunner(r.ID, true); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		stopped++
+	}
+	if len(errs) > 0 {
+		return stopped, joinErrors(errs)
+	}
+	return stopped, nil
 }
 
 // Close shuts down the manager and all runners

@@ -20,6 +20,20 @@ config:
   # Example: <PROJECT_ID>-firecracker-snapshots
   gcsBucket: PROJECT_ID-firecracker-snapshots
 
+gcp:
+  # Required for safe host scale-down (control plane deletes specific MIG instances).
+  projectId: PROJECT_ID
+  region: us-central1
+  hostMigName: firecracker-runner-ENV-hosts
+  hostAutoscalerName: firecracker-runner-ENV-hosts-autoscaler
+
+downscaler:
+  enabled: true
+  interval: 60s
+  maxDeletes: 1
+  maxDrains: 1
+  heartbeatStale: 90s
+
 env:
   db:
     secretName: db-credentials

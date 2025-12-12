@@ -71,6 +71,20 @@ env:
     secretName: github-credentials
     webhookSecretKey: webhook_secret
 
+gcp:
+  # Required for safe scale-down (control plane deletes specific MIG instances).
+  projectId: your-project-id
+  region: us-central1
+  hostMigName: firecracker-runner-dev-hosts
+  hostAutoscalerName: firecracker-runner-dev-hosts-autoscaler
+
+downscaler:
+  enabled: true
+  interval: 60s
+  maxDeletes: 1
+  maxDrains: 1
+  heartbeatStale: 90s
+
 service:
   type: ClusterIP
   ports:

@@ -64,6 +64,24 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.env.github.secretName }}
                   key: {{ .Values.env.github.webhookSecretKey }}
+            - name: GCP_PROJECT_ID
+              value: {{ .Values.gcp.projectId | quote }}
+            - name: GCP_REGION
+              value: {{ .Values.gcp.region | quote }}
+            - name: HOST_MIG_NAME
+              value: {{ .Values.gcp.hostMigName | quote }}
+            - name: HOST_AUTOSCALER_NAME
+              value: {{ .Values.gcp.hostAutoscalerName | quote }}
+            - name: DOWNSCALER_ENABLED
+              value: {{ .Values.downscaler.enabled | quote }}
+            - name: DOWNSCALER_INTERVAL
+              value: {{ .Values.downscaler.interval | quote }}
+            - name: DOWNSCALER_MAX_DELETES
+              value: {{ .Values.downscaler.maxDeletes | quote }}
+            - name: DOWNSCALER_MAX_DRAINS
+              value: {{ .Values.downscaler.maxDrains | quote }}
+            - name: DOWNSCALER_HEARTBEAT_STALE
+              value: {{ .Values.downscaler.heartbeatStale | quote }}
           resources:
 {{ toYaml .Values.resources | indent 12 }}
           livenessProbe:

@@ -81,6 +81,12 @@ variable "microvm_subnet" {
   default     = "172.16.0.0/24"
 }
 
+variable "control_plane_addr" {
+  description = "Control plane address reachable from host VMs (e.g. internal LB DNS/IP:8080)"
+  type        = string
+  default     = ""
+}
+
 variable "vpc_cidr" {
   description = "CIDR range for the VPC"
   type        = string

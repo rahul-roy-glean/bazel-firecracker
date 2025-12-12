@@ -24,6 +24,7 @@ type Host struct {
 	SnapshotSyncedAt time.Time
 	LastHeartbeat    time.Time
 	GRPCAddress      string
+	HTTPAddress      string
 	CreatedAt        time.Time
 }
 
@@ -113,10 +114,12 @@ func (hr *HostRegistry) UpdateHeartbeat(ctx context.Context, hostID string, stat
 	_, err := hr.db.ExecContext(ctx, `
 		UPDATE hosts SET
 			used_slots = $2,
-			snapshot_version = $3,
+			idle_runners = $3,
+			busy_runners = $4,
+			snapshot_version = $5,
 			last_heartbeat = NOW()
 		WHERE id = $1
-	`, hostID, status.UsedSlots, status.SnapshotVersion)
+	`, hostID, status.UsedSlots, status.IdleRunners, status.BusyRunners, status.SnapshotVersion)
 
 	if err != nil {
 		return err
@@ -130,6 +133,107 @@ func (hr *HostRegistry) UpdateHeartbeat(ctx context.Context, hostID string, stat
 		host.LastHeartbeat = time.Now()
 	}
 
+	return nil
+}
+
+type HostHeartbeat struct {
+	InstanceName    string
+	Zone            string
+	GRPCAddress     string
+	HTTPAddress     string
+	TotalSlots      int
+	UsedSlots       int
+	IdleRunners     int
+	BusyRunners     int
+	SnapshotVersion string
+}
+
+// UpsertHeartbeat upserts the host record and updates heartbeat fields. It preserves
+// draining/terminating host states so a draining host doesn't get flipped back to ready
+// by a heartbeat.
+func (hr *HostRegistry) UpsertHeartbeat(ctx context.Context, hb HostHeartbeat) (*Host, bool, error) {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+
+	if hb.InstanceName == "" {
+		return nil, false, fmt.Errorf("missing instance_name")
+	}
+
+	var hostID string
+	var status string
+	err := hr.db.QueryRowContext(ctx, `
+		INSERT INTO hosts (
+			instance_name, zone, status, total_slots, used_slots, idle_runners, busy_runners,
+			snapshot_version, grpc_address, http_address, last_heartbeat
+		)
+		VALUES ($1, $2, 'ready', $3, $4, $5, $6, $7, $8, $9, NOW())
+		ON CONFLICT (instance_name) DO UPDATE SET
+			zone = EXCLUDED.zone,
+			total_slots = EXCLUDED.total_slots,
+			used_slots = EXCLUDED.used_slots,
+			idle_runners = EXCLUDED.idle_runners,
+			busy_runners = EXCLUDED.busy_runners,
+			snapshot_version = EXCLUDED.snapshot_version,
+			grpc_address = EXCLUDED.grpc_address,
+			http_address = EXCLUDED.http_address,
+			last_heartbeat = NOW(),
+			status = CASE
+				WHEN hosts.status IN ('draining','terminating') THEN hosts.status
+				ELSE 'ready'
+			END
+		RETURNING id, status
+	`, hb.InstanceName, hb.Zone, hb.TotalSlots, hb.UsedSlots, hb.IdleRunners, hb.BusyRunners, hb.SnapshotVersion, hb.GRPCAddress, hb.HTTPAddress).Scan(&hostID, &status)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to upsert host heartbeat: %w", err)
+	}
+
+	host := hr.hosts[hostID]
+	if host == nil {
+		host = &Host{ID: hostID}
+		hr.hosts[hostID] = host
+	}
+
+	host.InstanceName = hb.InstanceName
+	host.Zone = hb.Zone
+	host.Status = status
+	host.TotalSlots = hb.TotalSlots
+	host.UsedSlots = hb.UsedSlots
+	host.IdleRunners = hb.IdleRunners
+	host.BusyRunners = hb.BusyRunners
+	host.SnapshotVersion = hb.SnapshotVersion
+	host.GRPCAddress = hb.GRPCAddress
+	host.HTTPAddress = hb.HTTPAddress
+	host.LastHeartbeat = time.Now()
+
+	return host, status == "draining", nil
+}
+
+func (hr *HostRegistry) GetHostByInstanceName(instanceName string) (*Host, bool) {
+	hr.mu.RLock()
+	defer hr.mu.RUnlock()
+	for _, h := range hr.hosts {
+		if h.InstanceName == instanceName {
+			return h, true
+		}
+	}
+	return nil, false
+}
+
+func (hr *HostRegistry) SetHostStatusByInstanceName(ctx context.Context, instanceName, status string) error {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+
+	_, err := hr.db.ExecContext(ctx, `UPDATE hosts SET status = $2 WHERE instance_name = $1`, instanceName, status)
+	if err != nil {
+		return err
+	}
+
+	for _, h := range hr.hosts {
+		if h.InstanceName == instanceName {
+			h.Status = status
+			break
+		}
+	}
 	return nil
 }
 
@@ -270,8 +374,8 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 
 	// Load hosts
 	rows, err := hr.db.QueryContext(ctx, `
-		SELECT id, instance_name, zone, status, total_slots, used_slots,
-		       snapshot_version, last_heartbeat, grpc_address, created_at
+		SELECT id, instance_name, zone, status, total_slots, used_slots, idle_runners, busy_runners,
+		       snapshot_version, last_heartbeat, grpc_address, http_address, created_at
 		FROM hosts
 	`)
 	if err != nil {
@@ -281,12 +385,12 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 
 	for rows.Next() {
 		var h Host
-		var snapshotVersion, grpcAddress sql.NullString
+		var snapshotVersion, grpcAddress, httpAddress sql.NullString
 		var lastHeartbeat sql.NullTime
 
 		err := rows.Scan(&h.ID, &h.InstanceName, &h.Zone, &h.Status,
-			&h.TotalSlots, &h.UsedSlots, &snapshotVersion,
-			&lastHeartbeat, &grpcAddress, &h.CreatedAt)
+			&h.TotalSlots, &h.UsedSlots, &h.IdleRunners, &h.BusyRunners,
+			&snapshotVersion, &lastHeartbeat, &grpcAddress, &httpAddress, &h.CreatedAt)
 		if err != nil {
 			return err
 		}
@@ -299,6 +403,9 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 		}
 		if grpcAddress.Valid {
 			h.GRPCAddress = grpcAddress.String
+		}
+		if httpAddress.Valid {
+			h.HTTPAddress = httpAddress.String
 		}
 
 		hr.hosts[h.ID] = &h
@@ -351,5 +458,3 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 
 	return nil
 }
-
-

@@ -17,10 +17,10 @@ import (
 
 // GitHubWebhookHandler handles GitHub webhook events
 type GitHubWebhookHandler struct {
-	scheduler    *Scheduler
-	hostRegistry *HostRegistry
+	scheduler     *Scheduler
+	hostRegistry  *HostRegistry
 	webhookSecret string
-	logger       *logrus.Entry
+	logger        *logrus.Entry
 }
 
 // NewGitHubWebhookHandler creates a new webhook handler
@@ -37,16 +37,16 @@ func NewGitHubWebhookHandler(s *Scheduler, hr *HostRegistry, logger *logrus.Logg
 type WorkflowJobEvent struct {
 	Action      string `json:"action"`
 	WorkflowJob struct {
-		ID          int64    `json:"id"`
-		RunID       int64    `json:"run_id"`
-		Status      string   `json:"status"`
-		Conclusion  string   `json:"conclusion"`
-		Name        string   `json:"name"`
-		Labels      []string `json:"labels"`
-		RunnerID    int64    `json:"runner_id"`
-		RunnerName  string   `json:"runner_name"`
-		HeadBranch  string   `json:"head_branch"`
-		HeadSHA     string   `json:"head_sha"`
+		ID         int64    `json:"id"`
+		RunID      int64    `json:"run_id"`
+		Status     string   `json:"status"`
+		Conclusion string   `json:"conclusion"`
+		Name       string   `json:"name"`
+		Labels     []string `json:"labels"`
+		RunnerID   int64    `json:"runner_id"`
+		RunnerName string   `json:"runner_name"`
+		HeadBranch string   `json:"head_branch"`
+		HeadSHA    string   `json:"head_sha"`
 	} `json:"workflow_job"`
 	Repository struct {
 		ID       int64  `json:"id"`
@@ -133,12 +133,12 @@ func (h *GitHubWebhookHandler) handleWorkflowJob(ctx context.Context, body []byt
 	}
 
 	h.logger.WithFields(logrus.Fields{
-		"action":     event.Action,
-		"job_id":     event.WorkflowJob.ID,
-		"job_name":   event.WorkflowJob.Name,
-		"repo":       event.Repository.FullName,
-		"branch":     event.WorkflowJob.HeadBranch,
-		"labels":     event.WorkflowJob.Labels,
+		"action":   event.Action,
+		"job_id":   event.WorkflowJob.ID,
+		"job_name": event.WorkflowJob.Name,
+		"repo":     event.Repository.FullName,
+		"branch":   event.WorkflowJob.HeadBranch,
+		"labels":   event.WorkflowJob.Labels,
 	}).Info("Handling workflow_job event")
 
 	switch event.Action {
@@ -267,11 +267,9 @@ func (h *GitHubWebhookHandler) GenerateRunnerToken(ctx context.Context, repo str
 	// POST /orgs/{org}/actions/runners/registration-token
 
 	// This requires a GitHub App or PAT with admin:org or repo scope
-	
+
 	h.logger.WithField("repo", repo).Debug("Generating runner token")
-	
+
 	// Placeholder - implement actual GitHub API call
 	return "placeholder-token", nil
 }
-
-

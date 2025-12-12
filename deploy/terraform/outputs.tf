@@ -48,6 +48,16 @@ output "host_instance_group" {
   description = "Instance group for Firecracker hosts"
 }
 
+output "host_instance_group_manager_name" {
+  value       = google_compute_region_instance_group_manager.hosts.name
+  description = "Instance group manager name for Firecracker hosts (regional MIG manager name)"
+}
+
+output "host_autoscaler_name" {
+  value       = google_compute_region_autoscaler.hosts.name
+  description = "Autoscaler name for host MIG (used by safe downscaler)"
+}
+
 output "gke_cluster_name" {
   value       = google_container_cluster.control_plane.name
   description = "GKE cluster name"

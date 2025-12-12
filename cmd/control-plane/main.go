@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -36,6 +37,34 @@ var (
 
 func main() {
 	flag.Parse()
+
+	// Allow env vars to override defaults (useful for Kubernetes/Helm deployments).
+	if v := os.Getenv("DB_HOST"); v != "" && *dbHost == "localhost" {
+		*dbHost = v
+	}
+	if v := os.Getenv("DB_PORT"); v != "" && *dbPort == 5432 {
+		if p, err := strconv.Atoi(v); err == nil {
+			*dbPort = p
+		}
+	}
+	if v := os.Getenv("DB_USER"); v != "" && *dbUser == "postgres" {
+		*dbUser = v
+	}
+	if v := os.Getenv("DB_PASSWORD"); v != "" && *dbPassword == "" {
+		*dbPassword = v
+	}
+	if v := os.Getenv("DB_NAME"); v != "" && *dbName == "firecracker_runner" {
+		*dbName = v
+	}
+	if v := os.Getenv("DB_SSL_MODE"); v != "" && *dbSSLMode == "disable" {
+		*dbSSLMode = v
+	}
+	if v := os.Getenv("GCS_BUCKET"); v != "" && *gcsBucket == "" {
+		*gcsBucket = v
+	}
+	if v := os.Getenv("LOG_LEVEL"); v != "" && *logLevel == "info" {
+		*logLevel = v
+	}
 
 	// Setup logger
 	logger := logrus.New()
@@ -78,6 +107,11 @@ func main() {
 	scheduler := NewScheduler(hostRegistry, logger)
 	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, logger)
 
+	// Load existing state from DB (best-effort)
+	if err := hostRegistry.LoadFromDB(ctx); err != nil {
+		log.WithError(err).Warn("Failed to load host/runner state from DB")
+	}
+
 	// Create gRPC server
 	grpcServer := grpc.NewServer()
 
@@ -116,6 +150,7 @@ func main() {
 	httpMux.HandleFunc("/api/v1/runners/quarantine", controlPlaneServer.HandleQuarantineRunner)
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", controlPlaneServer.HandleUnquarantineRunner)
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
+	httpMux.HandleFunc("/api/v1/hosts/heartbeat", controlPlaneServer.HandleHostHeartbeat)
 	httpMux.HandleFunc("/api/v1/snapshots", controlPlaneServer.HandleGetSnapshots)
 	httpMux.HandleFunc("/webhook/github", controlPlaneServer.HandleGitHubWebhook)
 
@@ -134,6 +169,7 @@ func main() {
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
 	go snapshotManager.FreshnessCheckLoop(ctx)
+	go startDownscaler(ctx, db, hostRegistry, logger)
 
 	// Wait for shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -160,10 +196,13 @@ func initSchema(db *sql.DB) error {
 		status VARCHAR(20) NOT NULL DEFAULT 'starting',
 		total_slots INT NOT NULL,
 		used_slots INT NOT NULL DEFAULT 0,
+		idle_runners INT NOT NULL DEFAULT 0,
+		busy_runners INT NOT NULL DEFAULT 0,
 		snapshot_version VARCHAR(50),
 		snapshot_synced_at TIMESTAMP,
 		last_heartbeat TIMESTAMP,
 		grpc_address VARCHAR(255),
+		http_address VARCHAR(255),
 		created_at TIMESTAMP DEFAULT NOW(),
 		UNIQUE(instance_name)
 	);
@@ -199,8 +238,22 @@ func initSchema(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_snapshots_status ON snapshots(status);
 	`
 
-	_, err := db.Exec(schema)
-	return err
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Backwards-compatible migrations (no-ops if already applied)
+	migrations := []string{
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS idle_runners INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS busy_runners INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS http_address VARCHAR(255)`,
+	}
+	for _, stmt := range migrations {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Placeholder types and registration

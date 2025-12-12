@@ -325,5 +325,3 @@ func (sm *SnapshotManager) RolloutSnapshot(ctx context.Context, version string, 
 	// For now, just update the status
 	return sm.SetActiveSnapshot(ctx, version)
 }
-
-

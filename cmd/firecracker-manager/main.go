@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
+	"strings"
 	"syscall"
 	"time"
 
@@ -77,6 +82,11 @@ func main() {
 	}
 	if *snapshotBucket == "" {
 		log.Fatal("Snapshot bucket not configured")
+	}
+
+	// Get control plane address from instance metadata if not provided.
+	if *controlPlane == "" {
+		*controlPlane = getMetadataAttribute("control-plane")
 	}
 
 	// Create runner manager config
@@ -170,11 +180,11 @@ func main() {
 	}()
 
 	// Start autoscaler loop
-	go autoscaleLoop(ctx, mgr, logger)
+	go autoscaleLoop(ctx, mgr, *idleTarget, logger)
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
-		go heartbeatLoop(ctx, mgr, *controlPlane, logger)
+		go heartbeatLoop(ctx, mgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger)
 	}
 
 	// Wait for shutdown signal
@@ -216,7 +226,7 @@ func readyHandler(mgr *runner.Manager) http.HandlerFunc {
 	}
 }
 
-func autoscaleLoop(ctx context.Context, mgr *runner.Manager, logger *logrus.Logger) {
+func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, logger *logrus.Logger) {
 	log := logger.WithField("component", "autoscaler")
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -229,7 +239,7 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, logger *logrus.Logg
 			status := mgr.GetStatus()
 
 			// Maintain idle target
-			if status.IdleRunners < 2 && mgr.CanAddRunner() {
+			if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
 				log.Debug("Adding runner to maintain idle pool")
 				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
 				if err != nil {
@@ -248,18 +258,115 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, logger *logrus.Logg
 	}
 }
 
-func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane string, logger *logrus.Logger) {
+type hostHeartbeatRequest struct {
+	InstanceName    string `json:"instance_name"`
+	Zone            string `json:"zone"`
+	GRPCAddress     string `json:"grpc_address"`
+	HTTPAddress     string `json:"http_address"`
+	TotalSlots      int    `json:"total_slots"`
+	UsedSlots       int    `json:"used_slots"`
+	IdleRunners     int    `json:"idle_runners"`
+	BusyRunners     int    `json:"busy_runners"`
+	SnapshotVersion string `json:"snapshot_version"`
+	Draining        bool   `json:"draining"`
+}
+
+type hostHeartbeatResponse struct {
+	Acknowledged bool   `json:"acknowledged"`
+	ShouldDrain  bool   `json:"should_drain"`
+	Error        string `json:"error,omitempty"`
+}
+
+func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger) {
 	log := logger.WithField("component", "heartbeat")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+
+	controlPlane = strings.TrimSpace(controlPlane)
+	if !strings.HasPrefix(controlPlane, "http://") && !strings.HasPrefix(controlPlane, "https://") {
+		controlPlane = "http://" + controlPlane
+	}
+	heartbeatURL := strings.TrimRight(controlPlane, "/") + "/api/v1/hosts/heartbeat"
+
+	internalIP := getMetadataValue("instance/network-interfaces/0/ip")
+	if internalIP == "" {
+		internalIP = getLocalIPFallback()
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	wasDraining := mgr.IsDraining()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// TODO: Implement control plane heartbeat
-			log.Debug("Heartbeat tick")
+			status := mgr.GetStatus()
+			reqBody := hostHeartbeatRequest{
+				InstanceName:    instanceName,
+				Zone:            zone,
+				GRPCAddress:     fmt.Sprintf("%s:%d", internalIP, grpcPort),
+				HTTPAddress:     fmt.Sprintf("%s:%d", internalIP, httpPort),
+				TotalSlots:      status.TotalSlots,
+				UsedSlots:       status.UsedSlots,
+				IdleRunners:     status.IdleRunners,
+				BusyRunners:     status.BusyRunners,
+				SnapshotVersion: status.SnapshotVersion,
+				Draining:        status.Draining,
+			}
+
+			b, _ := json.Marshal(reqBody)
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, heartbeatURL, bytes.NewReader(b))
+			if err != nil {
+				log.WithError(err).Warn("Failed to create heartbeat request")
+				continue
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				log.WithError(err).Warn("Heartbeat request failed")
+				continue
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if resp.StatusCode >= 400 {
+				log.WithFields(logrus.Fields{
+					"status": resp.StatusCode,
+					"body":   string(body),
+				}).Warn("Heartbeat rejected by control plane")
+				continue
+			}
+
+			var hbResp hostHeartbeatResponse
+			if err := json.Unmarshal(body, &hbResp); err != nil {
+				log.WithError(err).WithField("body", string(body)).Warn("Failed to parse heartbeat response")
+				continue
+			}
+			if hbResp.Error != "" {
+				log.WithField("error", hbResp.Error).Warn("Control plane heartbeat error")
+				continue
+			}
+
+			changed := mgr.SetDraining(hbResp.ShouldDrain)
+			if changed {
+				if hbResp.ShouldDrain {
+					wasDraining = true
+					drained, err := mgr.DrainIdleRunners(ctx)
+					if err != nil {
+						log.WithError(err).WithField("drained_idle_runners", drained).Warn("Failed to drain idle runners")
+					} else {
+						log.WithField("drained_idle_runners", drained).Info("Host entered draining mode")
+					}
+				} else {
+					wasDraining = false
+					log.Info("Host exited draining mode")
+				}
+			} else if hbResp.ShouldDrain && !wasDraining {
+				// Defensive: if we missed a transition, ensure we drain once.
+				wasDraining = true
+				_, _ = mgr.DrainIdleRunners(ctx)
+			}
 		}
 	}
 }
@@ -282,9 +389,12 @@ func loggingInterceptor(logger *logrus.Logger) grpc.UnaryServerInterceptor {
 
 func getInstanceMetadata() (hostID, instanceName, zone string) {
 	// Try to get from GCP metadata service
-	hostID = getMetadataAttribute("instance-id")
-	instanceName = getMetadataAttribute("name")
-	zone = getMetadataAttribute("zone")
+	hostID = getMetadataValue("instance/id")
+	instanceName = getMetadataValue("instance/name")
+	zone = getMetadataValue("instance/zone")
+	if zone != "" {
+		zone = path.Base(zone)
+	}
 
 	if hostID == "" {
 		hostID = os.Getenv("HOST_ID")
@@ -330,4 +440,56 @@ func getMetadataAttribute(attr string) string {
 	buf := make([]byte, 1024)
 	n, _ := resp.Body.Read(buf)
 	return string(buf[:n])
+}
+
+func getMetadataValue(path string) string {
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := fmt.Sprintf("http://metadata.google.internal/computeMetadata/v1/%s", strings.TrimPrefix(path, "/"))
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	buf := make([]byte, 4096)
+	n, _ := resp.Body.Read(buf)
+	return strings.TrimSpace(string(buf[:n]))
+}
+
+func getLocalIPFallback() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil {
+				continue
+			}
+			ip = ip.To4()
+			if ip == nil {
+				continue
+			}
+			return ip.String()
+		}
+	}
+	return ""
 }

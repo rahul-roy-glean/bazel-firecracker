@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -352,4 +353,3 @@ func (UnimplementedHostAgentServer) GetRunner(context.Context, *GetRunnerRequest
 func RegisterHostAgentServer(s *grpc.Server, srv *HostAgentServer) {
 	// In production, this would use the generated registration function
 }
-

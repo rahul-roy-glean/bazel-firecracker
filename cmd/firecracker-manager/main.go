@@ -23,24 +23,25 @@ import (
 )
 
 var (
-	grpcPort       = flag.Int("grpc-port", 50051, "gRPC server port")
-	httpPort       = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
-	maxRunners     = flag.Int("max-runners", 16, "Maximum runners per host")
-	idleTarget     = flag.Int("idle-target", 2, "Target number of idle runners")
-	vcpusPerRunner = flag.Int("vcpus-per-runner", 4, "vCPUs per runner")
-	memoryPerRunner = flag.Int("memory-per-runner", 8192, "Memory MB per runner")
-	firecrackerBin = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
-	socketDir      = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
-	workspaceDir   = flag.String("workspace-dir", "/mnt/nvme/workspaces", "Directory for workspaces")
-	logDir         = flag.String("log-dir", "/var/log/firecracker", "Directory for VM logs")
-	snapshotBucket = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
-	snapshotCache  = flag.String("snapshot-cache", "/mnt/nvme/snapshots", "Local snapshot cache path")
-	microVMSubnet  = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
-	extInterface   = flag.String("ext-interface", "eth0", "External network interface")
-	bridgeName     = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
-	environment    = flag.String("environment", "dev", "Environment name")
-	controlPlane   = flag.String("control-plane", "", "Control plane address")
-	logLevel       = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	grpcPort             = flag.Int("grpc-port", 50051, "gRPC server port")
+	httpPort             = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
+	maxRunners           = flag.Int("max-runners", 16, "Maximum runners per host")
+	idleTarget           = flag.Int("idle-target", 2, "Target number of idle runners")
+	vcpusPerRunner       = flag.Int("vcpus-per-runner", 4, "vCPUs per runner")
+	memoryPerRunner      = flag.Int("memory-per-runner", 8192, "Memory MB per runner")
+	firecrackerBin       = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
+	socketDir            = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
+	workspaceDir         = flag.String("workspace-dir", "/mnt/nvme/workspaces", "Directory for workspaces")
+	logDir               = flag.String("log-dir", "/var/log/firecracker", "Directory for VM logs")
+	snapshotBucket       = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
+	snapshotCache        = flag.String("snapshot-cache", "/mnt/nvme/snapshots", "Local snapshot cache path")
+	repoCacheUpperSizeGB = flag.Int("repo-cache-upper-size-gb", 10, "Size in GB of the per-runner repo cache writable layer (upper)")
+	microVMSubnet        = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
+	extInterface         = flag.String("ext-interface", "eth0", "External network interface")
+	bridgeName           = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
+	environment          = flag.String("environment", "dev", "Environment name")
+	controlPlane         = flag.String("control-plane", "", "Control plane address")
+	logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 )
 
 func main() {
@@ -76,24 +77,25 @@ func main() {
 
 	// Create runner manager config
 	cfg := runner.HostConfig{
-		HostID:            hostID,
-		InstanceName:      instanceName,
-		Zone:              zone,
-		MaxRunners:        *maxRunners,
-		IdleTarget:        *idleTarget,
-		VCPUsPerRunner:    *vcpusPerRunner,
-		MemoryMBPerRunner: *memoryPerRunner,
-		FirecrackerBin:    *firecrackerBin,
-		SocketDir:         *socketDir,
-		WorkspaceDir:      *workspaceDir,
-		LogDir:            *logDir,
-		SnapshotBucket:    *snapshotBucket,
-		SnapshotCachePath: *snapshotCache,
-		MicroVMSubnet:     *microVMSubnet,
-		ExternalInterface: *extInterface,
-		BridgeName:        *bridgeName,
-		Environment:       *environment,
-		ControlPlaneAddr:  *controlPlane,
+		HostID:               hostID,
+		InstanceName:         instanceName,
+		Zone:                 zone,
+		MaxRunners:           *maxRunners,
+		IdleTarget:           *idleTarget,
+		VCPUsPerRunner:       *vcpusPerRunner,
+		MemoryMBPerRunner:    *memoryPerRunner,
+		FirecrackerBin:       *firecrackerBin,
+		SocketDir:            *socketDir,
+		WorkspaceDir:         *workspaceDir,
+		LogDir:               *logDir,
+		SnapshotBucket:       *snapshotBucket,
+		SnapshotCachePath:    *snapshotCache,
+		RepoCacheUpperSizeGB: *repoCacheUpperSizeGB,
+		MicroVMSubnet:        *microVMSubnet,
+		ExternalInterface:    *extInterface,
+		BridgeName:           *bridgeName,
+		Environment:          *environment,
+		ControlPlaneAddr:     *controlPlane,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -319,4 +321,3 @@ func getMetadataAttribute(attr string) string {
 	n, _ := resp.Body.Read(buf)
 	return string(buf[:n])
 }
-

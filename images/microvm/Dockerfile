@@ -66,7 +66,14 @@ RUN curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VE
 
 # Create directories
 RUN mkdir -p /workspace /var/run/thaw-agent /var/log/thaw-agent \
-    && chown -R runner:runner /workspace
+    /mnt/ephemeral/caches/repository \
+    /mnt/ephemeral/bazel \
+    /mnt/ephemeral/output \
+    && chown -R runner:runner /workspace /mnt/ephemeral
+
+# Default Bazel user config: align repository_cache to the shared overlay target.
+RUN echo 'build --repository_cache=/mnt/ephemeral/caches/repository' > /home/runner/.bazelrc \
+    && chown runner:runner /home/runner/.bazelrc
 
 # Configure systemd
 RUN systemctl set-default multi-user.target \
@@ -131,4 +138,5 @@ RUN ln -sf /lib/systemd/systemd /init
 
 # The actual rootfs extraction happens via:
 # docker export $(docker create <image>) | tar -C rootfs -xf -
+
 

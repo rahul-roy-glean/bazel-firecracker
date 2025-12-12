@@ -403,3 +403,4 @@ func (c *Client) SocketPath() string {
 	return c.socketPath
 }
 
+

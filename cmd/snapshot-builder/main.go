@@ -16,18 +16,20 @@ import (
 )
 
 var (
-	repoURL        = flag.String("repo-url", "", "Repository URL to clone")
-	repoBranch     = flag.String("repo-branch", "main", "Branch to checkout")
-	bazelVersion   = flag.String("bazel-version", "7.x", "Bazel version")
-	gcsBucket      = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
-	outputDir      = flag.String("output-dir", "/tmp/snapshot", "Output directory for snapshot files")
-	kernelPath     = flag.String("kernel-path", "/opt/firecracker/kernel.bin", "Path to kernel")
-	rootfsPath     = flag.String("rootfs-path", "/opt/firecracker/rootfs.img", "Path to base rootfs")
-	firecrackerBin = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
-	vcpus          = flag.Int("vcpus", 4, "vCPUs for warmup VM")
-	memoryMB       = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
-	warmupTimeout  = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
-	logLevel       = flag.String("log-level", "info", "Log level")
+	repoURL             = flag.String("repo-url", "", "Repository URL to clone")
+	repoBranch          = flag.String("repo-branch", "main", "Branch to checkout")
+	bazelVersion        = flag.String("bazel-version", "7.x", "Bazel version")
+	gcsBucket           = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
+	outputDir           = flag.String("output-dir", "/tmp/snapshot", "Output directory for snapshot files")
+	kernelPath          = flag.String("kernel-path", "/opt/firecracker/kernel.bin", "Path to kernel")
+	rootfsPath          = flag.String("rootfs-path", "/opt/firecracker/rootfs.img", "Path to base rootfs")
+	firecrackerBin      = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
+	vcpus               = flag.Int("vcpus", 4, "vCPUs for warmup VM")
+	memoryMB            = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
+	warmupTimeout       = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
+	repoCacheSeedSizeGB = flag.Int("repo-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared Bazel repository cache seed)")
+	repoCacheSeedDir    = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
+	logLevel            = flag.String("log-level", "info", "Log level")
 )
 
 func main() {
@@ -71,6 +73,31 @@ func main() {
 		log.WithError(err).Fatal("Failed to copy rootfs")
 	}
 
+	// Create (or seed) shared repo cache seed image
+	repoCacheSeedImg := filepath.Join(*outputDir, "repo-cache-seed.img")
+	log.WithFields(logrus.Fields{
+		"path":     repoCacheSeedImg,
+		"size_gb":  *repoCacheSeedSizeGB,
+		"seed_dir": *repoCacheSeedDir,
+	}).Info("Creating repo-cache seed image")
+	if err := createExt4Image(repoCacheSeedImg, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
+		log.WithError(err).Fatal("Failed to create repo-cache seed image")
+	}
+	if *repoCacheSeedDir != "" {
+		if err := seedExt4ImageFromDir(repoCacheSeedImg, *repoCacheSeedDir, log); err != nil {
+			// Seeding can require root privileges (mount loop). We log and proceed with an empty seed image.
+			log.WithError(err).Warn("Failed to seed repo-cache image from directory; continuing with empty seed")
+		}
+	}
+
+	// Create a placeholder per-VM repo cache upper image for the snapshot-build VM.
+	// At runtime each runner gets its own upper image, but the snapshot should
+	// include the same device layout (drive IDs) for compatibility.
+	repoCacheUpperImg := filepath.Join(*outputDir, "repo-cache-upper.img")
+	if err := createExt4Image(repoCacheUpperImg, 1, "BAZEL_REPO_UPPER"); err != nil {
+		log.WithError(err).Fatal("Failed to create repo-cache upper image")
+	}
+
 	// Create VM for warmup
 	vmID := "snapshot-builder"
 	socketPath := filepath.Join(*outputDir, "firecracker.sock")
@@ -84,6 +111,20 @@ func main() {
 		VCPUs:          *vcpus,
 		MemoryMB:       *memoryMB,
 		BootArgs:       "console=ttyS0 reboot=k panic=1 pci=off init=/init",
+		Drives: []firecracker.Drive{
+			{
+				DriveID:      "repo-cache-seed",
+				PathOnHost:   repoCacheSeedImg,
+				IsRootDevice: false,
+				IsReadOnly:   true,
+			},
+			{
+				DriveID:      "repo-cache-upper",
+				PathOnHost:   repoCacheUpperImg,
+				IsRootDevice: false,
+				IsReadOnly:   false,
+			},
+		},
 	}
 
 	vm, err := firecracker.NewVM(vmCfg, logger)
@@ -128,7 +169,7 @@ func main() {
 
 	// Get file sizes
 	var totalSize int64
-	for _, f := range []string{kernelOutput, workingRootfs, snapshotPath, memPath} {
+	for _, f := range []string{kernelOutput, workingRootfs, snapshotPath, memPath, repoCacheSeedImg} {
 		info, _ := os.Stat(f)
 		if info != nil {
 			totalSize += info.Size()
@@ -137,15 +178,16 @@ func main() {
 
 	// Create metadata
 	metadata := snapshot.SnapshotMetadata{
-		Version:      version,
-		BazelVersion: *bazelVersion,
-		RepoCommit:   getGitCommit(*outputDir),
-		CreatedAt:    time.Now(),
-		SizeBytes:    totalSize,
-		KernelPath:   "kernel.bin",
-		RootfsPath:   "rootfs.img",
-		MemPath:      "snapshot.mem",
-		StatePath:    "snapshot.state",
+		Version:           version,
+		BazelVersion:      *bazelVersion,
+		RepoCommit:        getGitCommit(*outputDir),
+		CreatedAt:         time.Now(),
+		SizeBytes:         totalSize,
+		KernelPath:        "kernel.bin",
+		RootfsPath:        "rootfs.img",
+		MemPath:           "snapshot.mem",
+		StatePath:         "snapshot.state",
+		RepoCacheSeedPath: "repo-cache-seed.img",
 	}
 
 	// Upload to GCS
@@ -187,7 +229,7 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, log *logrus.Entry) e
 
 	// For now, just wait a fixed time
 	log.Info("Waiting for warmup (placeholder)...")
-	
+
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -211,6 +253,62 @@ func copyFile(src, dst string) error {
 	return cmd.Run()
 }
 
+func createExt4Image(path string, sizeGB int, label string) error {
+	if sizeGB <= 0 {
+		return fmt.Errorf("invalid sizeGB: %d", sizeGB)
+	}
+	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", sizeGB), path).Run(); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
+	}
+	// mkfs.ext4 works on regular files with -F
+	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, path).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+	}
+	return nil
+}
+
+func seedExt4ImageFromDir(imgPath, seedDir string, log *logrus.Entry) error {
+	info, err := os.Stat(seedDir)
+	if err != nil {
+		return fmt.Errorf("seed dir stat failed: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("seed dir is not a directory: %s", seedDir)
+	}
+
+	mountPoint := filepath.Join(filepath.Dir(imgPath), "mnt-repo-cache-seed")
+	if err := os.MkdirAll(mountPoint, 0755); err != nil {
+		return fmt.Errorf("failed to create mount point: %w", err)
+	}
+	defer os.RemoveAll(mountPoint)
+
+	// Mount loopback image (requires root)
+	if output, err := exec.Command("mount", "-o", "loop", imgPath, mountPoint).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount loop failed: %s: %w", string(output), err)
+	}
+	defer func() {
+		if output, err := exec.Command("umount", mountPoint).CombinedOutput(); err != nil {
+			log.WithError(err).WithField("output", string(output)).Warn("Failed to unmount repo-cache seed image")
+		}
+	}()
+
+	// Copy seed content into the image root
+	// We prefer rsync for correctness (preserve permissions, symlinks) if available.
+	if _, err := exec.LookPath("rsync"); err == nil {
+		cmd := exec.Command("rsync", "-a", "--delete", seedDir+string(os.PathSeparator), mountPoint+string(os.PathSeparator))
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("rsync failed: %s: %w", string(output), err)
+		}
+		return nil
+	}
+
+	cmd := exec.Command("cp", "-a", seedDir+string(os.PathSeparator)+".", mountPoint+string(os.PathSeparator))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("cp -a failed: %s: %w", string(output), err)
+	}
+	return nil
+}
+
 func getGitCommit(dir string) string {
 	cmd := exec.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = dir
@@ -220,4 +318,3 @@ func getGitCommit(dir string) string {
 	}
 	return string(out[:40])
 }
-

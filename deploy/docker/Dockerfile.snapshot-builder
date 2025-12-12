@@ -44,3 +44,4 @@ RUN mkdir -p /tmp/snapshot /opt/firecracker
 
 ENTRYPOINT ["./snapshot-builder"]
 
+

@@ -198,6 +198,63 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 		}
 	}
 
+	// Configure metrics if specified
+	if vm.config.MetricsPath != "" {
+		if err := vm.client.SetMetrics(ctx, Metrics{
+			MetricsPath: vm.config.MetricsPath,
+		}); err != nil {
+			vm.logger.WithError(err).Warn("Failed to configure metrics")
+		}
+	}
+
+	// Set machine config. For snapshot restore, Firecracker expects the machine
+	// config to match the snapshot.
+	if err := vm.client.SetMachineConfig(ctx, MachineConfig{
+		VCPUCount:       vm.config.VCPUs,
+		MemSizeMib:      vm.config.MemoryMB,
+		TrackDirtyPages: true,
+	}); err != nil {
+		return fmt.Errorf("failed to set machine config: %w", err)
+	}
+
+	// Add root drive (must match snapshot configuration)
+	if err := vm.client.AddDrive(ctx, Drive{
+		DriveID:      "rootfs",
+		PathOnHost:   vm.config.RootfsPath,
+		IsRootDevice: true,
+		IsReadOnly:   false,
+	}); err != nil {
+		return fmt.Errorf("failed to add root drive: %w", err)
+	}
+
+	// Add additional drives (must match snapshot configuration)
+	for _, drive := range vm.config.Drives {
+		if err := vm.client.AddDrive(ctx, drive); err != nil {
+			return fmt.Errorf("failed to add drive %s: %w", drive.DriveID, err)
+		}
+	}
+
+	// Configure network interface (must match snapshot configuration)
+	if vm.config.NetworkIface != nil {
+		if err := vm.client.AddNetworkInterface(ctx, *vm.config.NetworkIface); err != nil {
+			return fmt.Errorf("failed to add network interface: %w", err)
+		}
+	}
+
+	// Configure vsock (optional)
+	if vm.config.Vsock != nil {
+		if err := vm.client.SetVsock(ctx, *vm.config.Vsock); err != nil {
+			return fmt.Errorf("failed to set vsock: %w", err)
+		}
+	}
+
+	// Configure MMDS (optional but typically required for thaw-agent)
+	if vm.config.MMDSConfig != nil {
+		if err := vm.client.SetMMDSConfig(ctx, *vm.config.MMDSConfig); err != nil {
+			return fmt.Errorf("failed to set MMDS config: %w", err)
+		}
+	}
+
 	// Load the snapshot
 	if err := vm.client.LoadSnapshot(ctx, SnapshotLoadParams{
 		SnapshotPath: snapshotPath,
@@ -288,4 +345,3 @@ func (vm *VM) ID() string {
 func (vm *VM) Client() *Client {
 	return vm.client
 }
-

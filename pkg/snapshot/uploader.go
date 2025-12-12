@@ -61,6 +61,7 @@ func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata
 		{filepath.Join(localDir, "rootfs.img"), fmt.Sprintf("%s/rootfs.img", version)},
 		{filepath.Join(localDir, "snapshot.mem"), fmt.Sprintf("%s/snapshot.mem", version)},
 		{filepath.Join(localDir, "snapshot.state"), fmt.Sprintf("%s/snapshot.state", version)},
+		{filepath.Join(localDir, "repo-cache-seed.img"), fmt.Sprintf("%s/repo-cache-seed.img", version)},
 	}
 
 	bucket := u.gcsClient.Bucket(u.gcsBucket)
@@ -152,7 +153,7 @@ func (u *Uploader) UpdateCurrentPointer(ctx context.Context, version string) err
 	bucket := u.gcsClient.Bucket(u.gcsBucket)
 
 	// Copy all files from version to current
-	files := []string{"kernel.bin", "rootfs.img", "snapshot.mem", "snapshot.state", "metadata.json"}
+	files := []string{"kernel.bin", "rootfs.img", "snapshot.mem", "snapshot.state", "repo-cache-seed.img", "metadata.json"}
 
 	for _, file := range files {
 		src := bucket.Object(fmt.Sprintf("%s/%s", version, file))
@@ -196,4 +197,3 @@ func (u *Uploader) Close() error {
 	}
 	return nil
 }
-

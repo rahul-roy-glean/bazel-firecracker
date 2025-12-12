@@ -17,14 +17,20 @@ import (
 )
 
 var (
-	mmdsEndpoint  = flag.String("mmds-endpoint", "http://169.254.169.254", "MMDS endpoint")
-	workspaceDir  = flag.String("workspace-dir", "/workspace", "Workspace directory")
-	runnerDir     = flag.String("runner-dir", "/home/runner", "GitHub runner directory")
-	logLevel      = flag.String("log-level", "info", "Log level")
-	readyFile     = flag.String("ready-file", "/var/run/thaw-agent/ready", "Ready signal file")
-	skipNetwork   = flag.Bool("skip-network", false, "Skip network configuration")
-	skipGitSync   = flag.Bool("skip-git-sync", false, "Skip git sync")
-	skipRunner    = flag.Bool("skip-runner", false, "Skip GitHub runner registration")
+	mmdsEndpoint           = flag.String("mmds-endpoint", "http://169.254.169.254", "MMDS endpoint")
+	workspaceDir           = flag.String("workspace-dir", "/workspace", "Workspace directory")
+	runnerDir              = flag.String("runner-dir", "/home/runner", "GitHub runner directory")
+	logLevel               = flag.String("log-level", "info", "Log level")
+	readyFile              = flag.String("ready-file", "/var/run/thaw-agent/ready", "Ready signal file")
+	skipNetwork            = flag.Bool("skip-network", false, "Skip network configuration")
+	skipGitSync            = flag.Bool("skip-git-sync", false, "Skip git sync")
+	skipRunner             = flag.Bool("skip-runner", false, "Skip GitHub runner registration")
+	skipRepoCache          = flag.Bool("skip-repo-cache", false, "Skip shared Bazel repository cache overlay setup")
+	repoCacheSeedDevice    = flag.String("repo-cache-seed-device", "/dev/vdb", "Block device for shared repo-cache seed (read-only mount inside VM)")
+	repoCacheUpperDevice   = flag.String("repo-cache-upper-device", "/dev/vdc", "Block device for per-runner repo-cache upper (writable mount inside VM)")
+	repoCacheSeedMount     = flag.String("repo-cache-seed-mount", "/mnt/bazel-repo-seed", "Mount point for repo-cache seed device")
+	repoCacheUpperMount    = flag.String("repo-cache-upper-mount", "/mnt/bazel-repo-upper", "Mount point for repo-cache upper device")
+	repoCacheOverlayTarget = flag.String("repo-cache-overlay-target", "/mnt/ephemeral/caches/repository", "Overlay mount target for Bazel --repository_cache")
 )
 
 // MMDSData represents the data structure from MMDS
@@ -89,6 +95,14 @@ func main() {
 		"branch":    mmdsData.Latest.Job.Branch,
 	}).Info("MMDS data received")
 
+	// Setup shared repo cache overlay (seed is shared across VMs, upper is per-VM).
+	if !*skipRepoCache {
+		log.Info("Setting up shared Bazel repository cache overlay...")
+		if err := setupRepoCacheOverlay(); err != nil {
+			log.WithError(err).Error("Failed to setup repo cache overlay")
+		}
+	}
+
 	// Configure network
 	if !*skipNetwork {
 		log.Info("Configuring network...")
@@ -132,6 +146,84 @@ func main() {
 	}
 
 	log.Info("Thaw agent complete")
+}
+
+func setupRepoCacheOverlay() error {
+	// Ensure mount points exist
+	if err := os.MkdirAll(*repoCacheSeedMount, 0755); err != nil {
+		return fmt.Errorf("failed to create seed mount dir: %w", err)
+	}
+	if err := os.MkdirAll(*repoCacheUpperMount, 0755); err != nil {
+		return fmt.Errorf("failed to create upper mount dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(*repoCacheOverlayTarget), 0755); err != nil {
+		return fmt.Errorf("failed to create overlay target parent dir: %w", err)
+	}
+	if err := os.MkdirAll(*repoCacheOverlayTarget, 0755); err != nil {
+		return fmt.Errorf("failed to create overlay target dir: %w", err)
+	}
+
+	seedDev := resolveDevice(*repoCacheSeedDevice, "BAZEL_REPO_SEED")
+	upperDev := resolveDevice(*repoCacheUpperDevice, "BAZEL_REPO_UPPER")
+
+	// Mount seed read-only (safe to share)
+	// Ignore if already mounted.
+	exec.Command("mountpoint", "-q", *repoCacheSeedMount).Run()
+	if err := exec.Command("mount", "-o", "ro", seedDev, *repoCacheSeedMount).Run(); err != nil {
+		// If mount fails because it's already mounted, proceed.
+		log.WithError(err).WithFields(logrus.Fields{
+			"device": seedDev,
+			"mount":  *repoCacheSeedMount,
+		}).Warn("Seed mount failed (may already be mounted)")
+	}
+
+	// Mount upper read-write
+	exec.Command("mountpoint", "-q", *repoCacheUpperMount).Run()
+	if err := exec.Command("mount", upperDev, *repoCacheUpperMount).Run(); err != nil {
+		log.WithError(err).WithFields(logrus.Fields{
+			"device": upperDev,
+			"mount":  *repoCacheUpperMount,
+		}).Warn("Upper mount failed (may already be mounted)")
+	}
+
+	upperDir := filepath.Join(*repoCacheUpperMount, "upper")
+	workDir := filepath.Join(*repoCacheUpperMount, "work")
+	if err := os.MkdirAll(upperDir, 0755); err != nil {
+		return fmt.Errorf("failed to create overlay upper dir: %w", err)
+	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return fmt.Errorf("failed to create overlay work dir: %w", err)
+	}
+
+	// Mount overlayfs at Bazel repository_cache path
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", *repoCacheSeedMount, upperDir, workDir)
+	if output, err := exec.Command("mount", "-t", "overlay", "overlay", "-o", opts, *repoCacheOverlayTarget).CombinedOutput(); err != nil {
+		return fmt.Errorf("overlay mount failed: %s: %w", string(output), err)
+	}
+
+	// Ensure the runner user can write into the repo cache path without recursively
+	// chowning (which would copy-up most of the seed into the upper layer).
+	_ = exec.Command("chown", "runner:runner", *repoCacheOverlayTarget).Run()
+
+	log.WithFields(logrus.Fields{
+		"seed_device":  seedDev,
+		"seed_mount":   *repoCacheSeedMount,
+		"upper_device": upperDev,
+		"upper_mount":  *repoCacheUpperMount,
+		"target":       *repoCacheOverlayTarget,
+	}).Info("Repo cache overlay mounted")
+
+	return nil
+}
+
+func resolveDevice(defaultDev string, label string) string {
+	// Prefer by-label path if present.
+	byLabel := filepath.Join("/dev/disk/by-label", label)
+	if _, err := os.Stat(byLabel); err == nil {
+		return byLabel
+	}
+	// Fall back to default device path.
+	return defaultDev
 }
 
 func waitForMMDS(ctx context.Context) (*MMDSData, error) {
@@ -260,7 +352,7 @@ func configureNetwork(data *MMDSData) error {
 
 func regenerateHostname(runnerID string) error {
 	hostname := fmt.Sprintf("runner-%s", runnerID[:8])
-	
+
 	if err := os.WriteFile("/etc/hostname", []byte(hostname+"\n"), 0644); err != nil {
 		return err
 	}
@@ -383,4 +475,3 @@ func signalReady() error {
 
 	return os.WriteFile(*readyFile, []byte(time.Now().Format(time.RFC3339)), 0644)
 }
-

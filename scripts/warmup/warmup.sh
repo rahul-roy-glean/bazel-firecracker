@@ -58,7 +58,7 @@ log "Configuring Bazel..."
 cat > ~/.bazelrc.warmup << 'EOF'
 # Warmup-specific Bazel configuration
 build --disk_cache=/home/runner/.cache/bazel-disk
-build --repository_cache=/home/runner/.cache/bazel-repo
+build --repository_cache=/mnt/ephemeral/caches/repository
 build --experimental_repository_cache_hardlinks
 
 # Performance settings
@@ -74,7 +74,7 @@ EOF
 # Ensure cache directories exist
 mkdir -p "$BAZEL_CACHE_DIR"
 mkdir -p /home/runner/.cache/bazel-disk
-mkdir -p /home/runner/.cache/bazel-repo
+mkdir -p /mnt/ephemeral/caches/repository
 
 # Run Bazel fetch to populate repository cache
 log "Running bazel fetch..."
@@ -118,4 +118,5 @@ while true; do
     # Periodically touch the completion marker to show we're alive
     touch "$COMPLETION_MARKER"
 done
+
 

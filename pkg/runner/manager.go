@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
@@ -109,6 +110,17 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		return nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
 	}
 
+	// Create per-runner writable repo cache layer image (upperdir/workdir lives here)
+	repoCacheUpperPath := filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
+	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
+		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
+	}
+	if err := createExt4Image(repoCacheUpperPath, m.config.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+	}
+
 	// Create runner record
 	runner := &Runner{
 		ID:              runnerID,
@@ -122,11 +134,12 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			VCPUs:    m.config.VCPUsPerRunner,
 			MemoryMB: m.config.MemoryMBPerRunner,
 		},
-		CreatedAt:     time.Now(),
-		SocketPath:    filepath.Join(m.config.SocketDir, runnerID+".sock"),
-		LogPath:       filepath.Join(m.config.LogDir, runnerID+".log"),
-		MetricsPath:   filepath.Join(m.config.LogDir, runnerID+".metrics"),
-		RootfsOverlay: overlayPath,
+		CreatedAt:      time.Now(),
+		SocketPath:     filepath.Join(m.config.SocketDir, runnerID+".sock"),
+		LogPath:        filepath.Join(m.config.LogDir, runnerID+".log"),
+		MetricsPath:    filepath.Join(m.config.LogDir, runnerID+".metrics"),
+		RootfsOverlay:  overlayPath,
+		RepoCacheUpper: repoCacheUpperPath,
 	}
 
 	// Create VM configuration
@@ -147,6 +160,20 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			Version:           "V2",
 			NetworkInterfaces: []string{"eth0"},
 		},
+		Drives: []firecracker.Drive{
+			{
+				DriveID:      "repo-cache-seed",
+				PathOnHost:   snapshotPaths.RepoCacheSeed,
+				IsRootDevice: false,
+				IsReadOnly:   true,
+			},
+			{
+				DriveID:      "repo-cache-upper",
+				PathOnHost:   repoCacheUpperPath,
+				IsRootDevice: false,
+				IsReadOnly:   false,
+			},
+		},
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
 	}
@@ -154,22 +181,29 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	// Create VM instance
 	vm, err := firecracker.NewVM(vmCfg, m.logger.Logger)
 	if err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath)
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
 	// Restore from snapshot
-	if err := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, true); err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath)
+	if err := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, false); err != nil {
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
 		return nil, fmt.Errorf("failed to restore from snapshot: %w", err)
 	}
 
-	// Inject MMDS data
+	// Inject MMDS data before resuming the VM.
 	mmdsData := m.buildMMDSData(runner, tap, req)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
-		m.cleanupRunner(runnerID, tap.Name, overlayPath)
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
 		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
+	}
+
+	// Resume the VM after snapshot load and MMDS injection.
+	if err := vm.Resume(ctx); err != nil {
+		vm.Stop()
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+		return nil, fmt.Errorf("failed to resume VM: %w", err)
 	}
 
 	runner.State = StateInitializing
@@ -232,14 +266,14 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 		delete(m.vms, runnerID)
 	}
 
-	m.cleanupRunner(runnerID, runner.TapDevice, runner.RootfsOverlay)
+	m.cleanupRunner(runnerID, runner.TapDevice, runner.RootfsOverlay, runner.RepoCacheUpper)
 	delete(m.runners, runnerID)
 
 	return nil
 }
 
 // cleanupRunner cleans up runner resources
-func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath string) {
+func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpperPath string) {
 	// Release TAP device
 	m.network.ReleaseTap(runnerID)
 
@@ -248,9 +282,27 @@ func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath string) {
 		os.Remove(overlayPath)
 	}
 
+	// Remove repo cache upper image
+	if repoCacheUpperPath != "" {
+		os.Remove(repoCacheUpperPath)
+	}
+
 	// Remove socket
 	socketPath := filepath.Join(m.config.SocketDir, runnerID+".sock")
 	os.Remove(socketPath)
+}
+
+func createExt4Image(path string, sizeGB int, label string) error {
+	if sizeGB <= 0 {
+		return fmt.Errorf("invalid sizeGB: %d", sizeGB)
+	}
+	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", sizeGB), path).Run(); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
+	}
+	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, path).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+	}
+	return nil
 }
 
 // GetRunner returns a runner by ID
@@ -376,4 +428,3 @@ func (m *Manager) Close() error {
 
 	return nil
 }
-

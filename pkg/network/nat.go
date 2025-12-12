@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package network
 
 import (
@@ -438,4 +441,5 @@ func (t *TapDevice) GetNetworkConfig() NetworkConfig {
 		MAC:       t.MAC,
 	}
 }
+
 

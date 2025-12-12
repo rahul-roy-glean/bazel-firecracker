@@ -39,6 +39,7 @@ type Runner struct {
 	LogPath         string
 	MetricsPath     string
 	RootfsOverlay   string
+	RepoCacheUpper  string
 }
 
 // Resources represents the resources allocated to a runner
@@ -103,29 +104,32 @@ type HostConfig struct {
 	LogDir            string
 	SnapshotBucket    string
 	SnapshotCachePath string
-	MicroVMSubnet     string
-	ExternalInterface string
-	BridgeName        string
-	Environment       string
-	ControlPlaneAddr  string
+	// RepoCacheUpperSizeGB controls the per-runner writable layer size for the
+	// Bazel repository cache overlay.
+	RepoCacheUpperSizeGB int
+	MicroVMSubnet        string
+	ExternalInterface    string
+	BridgeName           string
+	Environment          string
+	ControlPlaneAddr     string
 }
 
 // DefaultHostConfig returns a host config with sensible defaults
 func DefaultHostConfig() HostConfig {
 	return HostConfig{
-		MaxRunners:        16,
-		IdleTarget:        2,
-		VCPUsPerRunner:    4,
-		MemoryMBPerRunner: 8192,
-		FirecrackerBin:    "/usr/local/bin/firecracker",
-		SocketDir:         "/var/run/firecracker",
-		WorkspaceDir:      "/mnt/nvme/workspaces",
-		LogDir:            "/var/log/firecracker",
-		SnapshotCachePath: "/mnt/nvme/snapshots",
-		MicroVMSubnet:     "172.16.0.0/24",
-		ExternalInterface: "eth0",
-		BridgeName:        "fcbr0",
-		Environment:       "dev",
+		MaxRunners:           16,
+		IdleTarget:           2,
+		VCPUsPerRunner:       4,
+		MemoryMBPerRunner:    8192,
+		FirecrackerBin:       "/usr/local/bin/firecracker",
+		SocketDir:            "/var/run/firecracker",
+		WorkspaceDir:         "/mnt/nvme/workspaces",
+		LogDir:               "/var/log/firecracker",
+		SnapshotCachePath:    "/mnt/nvme/snapshots",
+		RepoCacheUpperSizeGB: 10,
+		MicroVMSubnet:        "172.16.0.0/24",
+		ExternalInterface:    "eth0",
+		BridgeName:           "fcbr0",
+		Environment:          "dev",
 	}
 }
-

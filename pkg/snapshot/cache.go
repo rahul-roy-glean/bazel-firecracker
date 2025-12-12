@@ -27,26 +27,30 @@ type SnapshotMetadata struct {
 	RootfsPath   string    `json:"rootfs_path"`
 	MemPath      string    `json:"mem_path"`
 	StatePath    string    `json:"state_path"`
+	// RepoCacheSeedPath is a path (relative to the snapshot version dir) to the
+	// shared Bazel repository cache seed disk image (ext4).
+	RepoCacheSeedPath string `json:"repo_cache_seed_path,omitempty"`
 }
 
 // SnapshotPaths holds the local paths to snapshot files
 type SnapshotPaths struct {
-	Kernel  string
-	Rootfs  string
-	Mem     string
-	State   string
-	Version string
+	Kernel        string
+	Rootfs        string
+	Mem           string
+	State         string
+	RepoCacheSeed string
+	Version       string
 }
 
 // Cache manages local snapshot cache with GCS sync
 type Cache struct {
-	localPath   string
-	gcsBucket   string
-	gcsClient   *storage.Client
-	currentVer  string
-	metadata    *SnapshotMetadata
-	mu          sync.RWMutex
-	logger      *logrus.Entry
+	localPath  string
+	gcsBucket  string
+	gcsClient  *storage.Client
+	currentVer string
+	metadata   *SnapshotMetadata
+	mu         sync.RWMutex
+	logger     *logrus.Entry
 }
 
 // CacheConfig holds configuration for snapshot cache
@@ -153,20 +157,22 @@ func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 	rootfsPath := filepath.Join(c.localPath, "rootfs.img")
 	memPath := filepath.Join(c.localPath, "snapshot.mem")
 	statePath := filepath.Join(c.localPath, "snapshot.state")
+	repoCacheSeedPath := filepath.Join(c.localPath, "repo-cache-seed.img")
 
 	// Verify files exist
-	for _, path := range []string{kernelPath, rootfsPath, memPath, statePath} {
+	for _, path := range []string{kernelPath, rootfsPath, memPath, statePath, repoCacheSeedPath} {
 		if _, err := os.Stat(path); err != nil {
 			return nil, fmt.Errorf("snapshot file not found: %s", path)
 		}
 	}
 
 	return &SnapshotPaths{
-		Kernel:  kernelPath,
-		Rootfs:  rootfsPath,
-		Mem:     memPath,
-		State:   statePath,
-		Version: c.currentVer,
+		Kernel:        kernelPath,
+		Rootfs:        rootfsPath,
+		Mem:           memPath,
+		State:         statePath,
+		RepoCacheSeed: repoCacheSeedPath,
+		Version:       c.currentVer,
 	}, nil
 }
 
@@ -267,15 +273,13 @@ func (c *Cache) CreateOverlay(runnerID string) (string, error) {
 		return "", fmt.Errorf("failed to create overlay directory: %w", err)
 	}
 
-	// Create qcow2 overlay backed by base rootfs
-	cmd := exec.Command("qemu-img", "create",
-		"-f", "qcow2",
-		"-F", "raw",
-		"-b", baseRootfs,
-		overlayPath,
-	)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("failed to create overlay: %s: %w", string(output), err)
+	// Firecracker expects raw block images. Instead of qcow2 overlays, create a
+	// sparse copy of the base rootfs (and use reflink where supported).
+	if output, err := exec.Command("cp", "--reflink=auto", "--sparse=always", baseRootfs, overlayPath).CombinedOutput(); err != nil {
+		// Fallback for systems without reflink support/flag.
+		if output2, err2 := exec.Command("cp", "--sparse=always", baseRootfs, overlayPath).CombinedOutput(); err2 != nil {
+			return "", fmt.Errorf("failed to copy rootfs overlay: %s / %s: %w", string(output), string(output2), err2)
+		}
 	}
 
 	c.logger.WithFields(logrus.Fields{
@@ -317,4 +321,3 @@ func (c *Cache) Close() error {
 	}
 	return nil
 }
-

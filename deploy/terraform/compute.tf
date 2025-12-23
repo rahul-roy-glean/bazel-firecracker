@@ -1,7 +1,19 @@
-# Host VM Image (reference to Packer-built image)
+# Host VM Image
+# When use_custom_host_image is false, use Ubuntu for initial deployment
+# After building with Packer, set use_custom_host_image = true
 data "google_compute_image" "host" {
+  count   = var.use_custom_host_image ? 1 : 0
   family  = "firecracker-host"
   project = var.project_id
+}
+
+data "google_compute_image" "ubuntu" {
+  family  = "ubuntu-2204-lts"
+  project = "ubuntu-os-cloud"
+}
+
+locals {
+  host_image = var.use_custom_host_image ? data.google_compute_image.host[0].self_link : data.google_compute_image.ubuntu.self_link
 }
 
 # Instance template for Firecracker hosts
@@ -21,14 +33,22 @@ resource "google_compute_instance_template" "firecracker_host" {
 
   # Boot disk
   disk {
-    source_image = data.google_compute_image.host.self_link
+    source_image = local.host_image
     disk_type    = "pd-ssd"
     disk_size_gb = var.host_disk_size_gb
     boot         = true
     auto_delete  = true
   }
 
-  # Local NVMe SSD for fast snapshot restore (~3GB/s read)
+  # Local NVMe SSDs for fast snapshot restore (~3GB/s read)
+  # n2-standard-16 requires SSDs in multiples of 2 (each 375GB)
+  disk {
+    type         = "SCRATCH"
+    disk_type    = "local-ssd"
+    disk_size_gb = 375
+    interface    = "NVME"
+  }
+
   disk {
     type         = "SCRATCH"
     disk_type    = "local-ssd"
@@ -47,10 +67,15 @@ resource "google_compute_instance_template" "firecracker_host" {
   }
 
   metadata = {
-    snapshot-bucket = google_storage_bucket.snapshots.name
-    microvm-subnet  = var.microvm_subnet
-    environment     = var.environment
-    control-plane   = var.control_plane_addr
+    snapshot-bucket       = google_storage_bucket.snapshots.name
+    microvm-subnet        = var.microvm_subnet
+    environment           = var.environment
+    control-plane         = var.control_plane_addr
+    git-cache-enabled     = var.git_cache_enabled ? "true" : "false"
+    git-cache-repos       = join(",", [for k, v in var.git_cache_repos : "${k}:${v}"])
+    git-cache-workspace   = var.git_cache_workspace_dir
+    github-app-id         = var.github_app_id
+    github-app-secret     = var.github_app_secret
   }
 
   metadata_startup_script = <<-EOF
@@ -83,6 +108,118 @@ resource "google_compute_instance_template" "firecracker_host" {
     # Sync snapshots from GCS to local NVMe
     echo "Syncing snapshots from GCS..."
     gsutil -m rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/nvme/snapshots/ || true
+
+    # Download Bazel cache image from GCS (single file, much faster than rsync)
+    echo "Downloading Bazel cache image from GCS..."
+    if gsutil -q stat "gs://$SNAPSHOT_BUCKET/cache/bazel-cache.img" 2>/dev/null; then
+      gsutil cp "gs://$SNAPSHOT_BUCKET/cache/bazel-cache.img" /mnt/nvme/cache.img
+      echo "Bazel cache image downloaded: $(ls -lh /mnt/nvme/cache.img)"
+    else
+      echo "No bazel-cache.img found in GCS, skipping cache setup"
+    fi
+
+    # Git cache setup (if enabled)
+    # Clones directly from GitHub - NO source code stored in GCS
+    GIT_CACHE_ENABLED=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-enabled || echo "false")
+
+    if [ "$GIT_CACHE_ENABLED" = "true" ]; then
+      echo "Setting up git-cache..."
+      mkdir -p /mnt/nvme/git-cache
+
+      # Get repo config from metadata
+      GIT_CACHE_REPOS=$(curl -sf -H "Metadata-Flavor: Google" \
+        http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-repos || echo "")
+
+      # Generate GitHub App installation token (for private repos)
+      GITHUB_APP_ID=$(curl -sf -H "Metadata-Flavor: Google" \
+        http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-app-id || echo "")
+      GITHUB_APP_SECRET=$(curl -sf -H "Metadata-Flavor: Google" \
+        http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-app-secret || echo "")
+
+      GIT_AUTH_URL=""
+      if [ -n "$GITHUB_APP_ID" ] && [ -n "$GITHUB_APP_SECRET" ]; then
+        echo "Generating GitHub App installation token..."
+        
+        # Fetch private key from Secret Manager
+        PEM=$(gcloud secrets versions access latest --secret="$GITHUB_APP_SECRET" 2>/dev/null || echo "")
+        
+        if [ -n "$PEM" ]; then
+          # Generate JWT
+          NOW=$(date +%s)
+          IAT=$((NOW - 60))
+          EXP=$((NOW + 600))
+          
+          b64enc() { openssl base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n'; }
+          
+          HEADER=$(echo -n '{"typ":"JWT","alg":"RS256"}' | b64enc)
+          PAYLOAD=$(echo -n "{\"iat\":$IAT,\"exp\":$EXP,\"iss\":$GITHUB_APP_ID}" | b64enc)
+          SIGNATURE=$(echo -n "$HEADER.$PAYLOAD" | openssl dgst -sha256 -sign <(echo "$PEM") | b64enc)
+          JWT="$HEADER.$PAYLOAD.$SIGNATURE"
+          
+          # Get installation ID and token
+          INSTALLATION_ID=$(curl -sf -H "Authorization: Bearer $JWT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/app/installations" | jq -r '.[0].id')
+          
+          if [ -n "$INSTALLATION_ID" ] && [ "$INSTALLATION_ID" != "null" ]; then
+            GIT_TOKEN=$(curl -sf -X POST \
+              -H "Authorization: Bearer $JWT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" | jq -r '.token')
+            
+            if [ -n "$GIT_TOKEN" ] && [ "$GIT_TOKEN" != "null" ]; then
+              GIT_AUTH_URL="x-access-token:$GIT_TOKEN@"
+              echo "GitHub App installation token generated successfully"
+            fi
+          fi
+        fi
+      fi
+
+      # Clone/update repos directly from GitHub
+      # Format: "github.com/org/repo:dirname,github.com/org/other:othername"
+      if [ -n "$GIT_CACHE_REPOS" ]; then
+        IFS=',' read -ra REPOS <<< "$GIT_CACHE_REPOS"
+        for mapping in "$${REPOS[@]}"; do
+          REPO_URL=$(echo "$mapping" | cut -d: -f1)
+          REPO_DIR=$(echo "$mapping" | cut -d: -f2)
+          CLONE_PATH="/mnt/nvme/git-cache/$REPO_DIR"
+
+          # Build authenticated URL
+          if [ -n "$GIT_AUTH_URL" ]; then
+            FULL_URL="https://$${GIT_AUTH_URL}$REPO_URL"
+          else
+            FULL_URL="https://$REPO_URL"
+          fi
+
+          if [ -d "$CLONE_PATH/.git" ]; then
+            echo "Updating existing clone: $REPO_DIR"
+            # Update remote URL in case token changed
+            (cd "$CLONE_PATH" && git remote set-url origin "$FULL_URL" && git fetch --all --prune) || true
+          else
+            echo "Cloning: $REPO_URL -> $REPO_DIR"
+            git clone "$FULL_URL" "$CLONE_PATH" || echo "Warning: Clone failed for $REPO_URL"
+          fi
+        done
+      fi
+
+      # Create git-cache block device for Firecracker
+      if [ -d /mnt/nvme/git-cache ] && [ "$(ls -A /mnt/nvme/git-cache)" ]; then
+        echo "Creating git-cache block device..."
+        rm -f /mnt/nvme/git-cache.img
+        truncate -s 80G /mnt/nvme/git-cache.img
+        mkfs.ext4 -F -L GIT_CACHE /mnt/nvme/git-cache.img
+        MOUNT_TMP=$(mktemp -d)
+        mount -o loop /mnt/nvme/git-cache.img "$MOUNT_TMP"
+        cp -a /mnt/nvme/git-cache/* "$MOUNT_TMP"/ || true
+        chown -R root:root "$MOUNT_TMP"
+        chmod -R 755 "$MOUNT_TMP"
+        sync
+        umount "$MOUNT_TMP"
+        rmdir "$MOUNT_TMP"
+        echo "Git-cache block device created"
+      fi
+    fi
 
     # Setup bridge networking for microVMs
     echo "Setting up bridge networking..."

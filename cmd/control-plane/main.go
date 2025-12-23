@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -20,6 +21,8 @@ import (
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
+
+	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 )
 
 var (
@@ -117,7 +120,7 @@ func main() {
 
 	// Register services
 	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, logger)
-	RegisterControlPlaneServer(grpcServer, controlPlaneServer)
+	pb.RegisterControlPlaneServer(grpcServer, controlPlaneServer)
 
 	// Register health service
 	healthServer := health.NewServer()
@@ -256,8 +259,9 @@ func initSchema(db *sql.DB) error {
 	return nil
 }
 
-// Placeholder types and registration
+// ControlPlaneServer implements the ControlPlane gRPC service
 type ControlPlaneServer struct {
+	pb.UnimplementedControlPlaneServer
 	scheduler       *Scheduler
 	hostRegistry    *HostRegistry
 	snapshotManager *SnapshotManager
@@ -273,26 +277,153 @@ func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, l
 	}
 }
 
-func RegisterControlPlaneServer(s *grpc.Server, srv *ControlPlaneServer) {
-	// In production, use generated registration
+// RegisterHost implements the gRPC RegisterHost method
+func (s *ControlPlaneServer) RegisterHost(ctx context.Context, req *pb.RegisterHostRequest) (*pb.RegisterHostResponse, error) {
+	s.logger.WithFields(logrus.Fields{
+		"instance_name": req.InstanceName,
+		"zone":          req.Zone,
+		"total_slots":   req.TotalSlots,
+	}).Info("RegisterHost request")
+
+	host, err := s.hostRegistry.RegisterHost(ctx, req.InstanceName, req.Zone, int(req.TotalSlots), "")
+	if err != nil {
+		return nil, err
+	}
+
+	currentSnapshot := s.snapshotManager.GetCurrentVersion()
+
+	return &pb.RegisterHostResponse{
+		HostId:          host.ID,
+		SnapshotVersion: currentSnapshot,
+	}, nil
 }
+
+// Heartbeat implements the gRPC Heartbeat method
+func (s *ControlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	if req.Status == nil {
+		return &pb.HeartbeatResponse{Acknowledged: false}, nil
+	}
+
+	err := s.hostRegistry.UpdateHeartbeat(ctx, req.HostId, HostStatus{
+		UsedSlots:       int(req.Status.UsedSlots),
+		IdleRunners:     int(req.Status.IdleRunners),
+		BusyRunners:     int(req.Status.BusyRunners),
+		SnapshotVersion: req.Status.SnapshotVersion,
+	})
+	if err != nil {
+		s.logger.WithError(err).Warn("Failed to update heartbeat")
+	}
+
+	currentSnapshot := s.snapshotManager.GetCurrentVersion()
+	shouldSync := currentSnapshot != "" && currentSnapshot != req.Status.SnapshotVersion
+
+	return &pb.HeartbeatResponse{
+		Acknowledged:       true,
+		SnapshotVersion:    currentSnapshot,
+		ShouldSyncSnapshot: shouldSync,
+	}, nil
+}
+
+// GetSnapshot implements the gRPC GetSnapshot method
+func (s *ControlPlaneServer) GetSnapshot(ctx context.Context, req *pb.GetSnapshotRequest) (*pb.Snapshot, error) {
+	version := req.Version
+	if version == "" || version == "current" {
+		version = s.snapshotManager.GetCurrentVersion()
+	}
+
+	snapshot, err := s.snapshotManager.GetSnapshot(ctx, version)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.snapshotManager.SnapshotToProto(snapshot), nil
+}
+
+// TriggerSnapshotBuild implements the gRPC TriggerSnapshotBuild method
+func (s *ControlPlaneServer) TriggerSnapshotBuild(ctx context.Context, req *pb.TriggerSnapshotBuildRequest) (*pb.TriggerSnapshotBuildResponse, error) {
+	buildID, err := s.snapshotManager.TriggerBuild(ctx, req.Repo, req.Branch, req.BazelVersion)
+	if err != nil {
+		return &pb.TriggerSnapshotBuildResponse{
+			Status: "error: " + err.Error(),
+		}, nil
+	}
+
+	return &pb.TriggerSnapshotBuildResponse{
+		BuildId: buildID,
+		Status:  "queued",
+	}, nil
+}
+
+// HTTP Handlers
 
 func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"runners": []}`))
+
+	hosts := s.hostRegistry.GetAllHosts()
+	var allRunners []map[string]interface{}
+
+	for _, h := range hosts {
+		// For now, return basic host runner info
+		for i := 0; i < h.IdleRunners+h.BusyRunners; i++ {
+			allRunners = append(allRunners, map[string]interface{}{
+				"host_id":   h.ID,
+				"host_name": h.InstanceName,
+				"status":    "running",
+			})
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"runners": allRunners,
+		"count":   len(allRunners),
+	})
 }
 
 func (s *ControlPlaneServer) HandleGetHosts(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"hosts": []}`))
+
+	hosts := s.hostRegistry.GetAllHosts()
+	var hostList []map[string]interface{}
+
+	for _, h := range hosts {
+		hostList = append(hostList, map[string]interface{}{
+			"id":               h.ID,
+			"instance_name":    h.InstanceName,
+			"zone":             h.Zone,
+			"status":           h.Status,
+			"total_slots":      h.TotalSlots,
+			"used_slots":       h.UsedSlots,
+			"idle_runners":     h.IdleRunners,
+			"busy_runners":     h.BusyRunners,
+			"snapshot_version": h.SnapshotVersion,
+			"last_heartbeat":   h.LastHeartbeat,
+			"grpc_address":     h.GRPCAddress,
+		})
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"hosts": hostList,
+		"count": len(hostList),
+	})
 }
 
 func (s *ControlPlaneServer) HandleGetSnapshots(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"snapshots": []}`))
+
+	snapshots, err := s.snapshotManager.ListSnapshots(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"snapshots":        snapshots,
+		"count":            len(snapshots),
+		"current_version":  s.snapshotManager.GetCurrentVersion(),
+	})
 }
 
 func (s *ControlPlaneServer) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
-	// Handled in webhook.go
-	w.WriteHeader(http.StatusOK)
+	handler := NewGitHubWebhookHandler(s.scheduler, s.hostRegistry, s.logger.Logger)
+	handler.HandleWebhook(w, r)
 }

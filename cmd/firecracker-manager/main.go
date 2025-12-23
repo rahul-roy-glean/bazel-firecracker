@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 )
@@ -51,6 +52,22 @@ var (
 	environment          = flag.String("environment", "dev", "Environment name")
 	controlPlane         = flag.String("control-plane", "", "Control plane address")
 	logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+
+	// Git cache flags
+	gitCacheEnabled      = flag.Bool("git-cache-enabled", false, "Enable git-cache reference cloning for faster repo setup")
+	gitCacheDir          = flag.String("git-cache-dir", "/mnt/nvme/git-cache", "Host directory containing git mirrors")
+	gitCacheImagePath    = flag.String("git-cache-image", "/mnt/nvme/git-cache.img", "Path to git-cache block device image")
+	gitCacheMountPath    = flag.String("git-cache-mount", "/mnt/git-cache", "Mount path inside microVMs for git-cache")
+	gitCacheRepos        = flag.String("git-cache-repos", "", "Comma-separated repo mappings (e.g. 'github.com/org/repo:repo-dir,github.com/org/other:other-dir')")
+	gitCacheWorkspaceDir = flag.String("git-cache-workspace", "/mnt/ephemeral/workdir", "Target directory for cloned repos inside microVMs")
+
+	// GitHub runner auto-registration flags (Option C)
+	githubRunnerEnabled = flag.Bool("github-runner-enabled", false, "Enable automatic GitHub runner registration at VM boot")
+	githubRepo          = flag.String("github-repo", "", "GitHub repository for runner registration (e.g., askscio/scio)")
+	githubRunnerLabels  = flag.String("github-runner-labels", "self-hosted,firecracker,Linux,X64", "Comma-separated runner labels")
+	githubAppID         = flag.String("github-app-id", "", "GitHub App ID for authentication")
+	githubAppSecret     = flag.String("github-app-secret", "", "Secret Manager secret name containing GitHub App private key")
+	gcpProject          = flag.String("gcp-project", "", "GCP project for Secret Manager")
 )
 
 func main() {
@@ -89,6 +106,67 @@ func main() {
 		*controlPlane = getMetadataAttribute("control-plane")
 	}
 
+	// Parse git-cache repo mappings
+	gitCacheRepoMappings := make(map[string]string)
+	if *gitCacheRepos != "" {
+		for _, mapping := range strings.Split(*gitCacheRepos, ",") {
+			parts := strings.SplitN(strings.TrimSpace(mapping), ":", 2)
+			if len(parts) == 2 {
+				gitCacheRepoMappings[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+
+	// Get git-cache enabled from metadata if not set via flag
+	gitCacheEnabledVal := *gitCacheEnabled
+	if !gitCacheEnabledVal {
+		if v := getMetadataAttribute("git-cache-enabled"); v == "true" {
+			gitCacheEnabledVal = true
+		}
+	}
+
+	// Get GitHub runner config from metadata if not set via flags
+	githubRunnerEnabledVal := *githubRunnerEnabled
+	if !githubRunnerEnabledVal {
+		if v := getMetadataAttribute("github-runner-enabled"); v == "true" {
+			githubRunnerEnabledVal = true
+		}
+	}
+	githubRepoVal := *githubRepo
+	if githubRepoVal == "" {
+		githubRepoVal = getMetadataAttribute("github-repo")
+	}
+	githubAppIDVal := *githubAppID
+	if githubAppIDVal == "" {
+		githubAppIDVal = getMetadataAttribute("github-app-id")
+	}
+	githubAppSecretVal := *githubAppSecret
+	if githubAppSecretVal == "" {
+		githubAppSecretVal = getMetadataAttribute("github-app-secret")
+	}
+	gcpProjectVal := *gcpProject
+	if gcpProjectVal == "" {
+		gcpProjectVal = getMetadataAttribute("gcp-project")
+		if gcpProjectVal == "" {
+			// Try to get from project metadata
+			gcpProjectVal = getProjectMetadata()
+		}
+	}
+
+	// Parse GitHub runner labels
+	var githubRunnerLabelsVal []string
+	labelsStr := *githubRunnerLabels
+	if labelsStr == "" {
+		labelsStr = getMetadataAttribute("github-runner-labels")
+	}
+	if labelsStr != "" {
+		for _, label := range strings.Split(labelsStr, ",") {
+			if l := strings.TrimSpace(label); l != "" {
+				githubRunnerLabelsVal = append(githubRunnerLabelsVal, l)
+			}
+		}
+	}
+
 	// Create runner manager config
 	cfg := runner.HostConfig{
 		HostID:                    hostID,
@@ -114,6 +192,20 @@ func main() {
 		BridgeName:                *bridgeName,
 		Environment:               *environment,
 		ControlPlaneAddr:          *controlPlane,
+		// Git cache config
+		GitCacheEnabled:      gitCacheEnabledVal,
+		GitCacheDir:          *gitCacheDir,
+		GitCacheImagePath:    *gitCacheImagePath,
+		GitCacheMountPath:    *gitCacheMountPath,
+		GitCacheRepoMappings: gitCacheRepoMappings,
+		GitCacheWorkspaceDir: *gitCacheWorkspaceDir,
+		// GitHub runner auto-registration (Option C)
+		GitHubRunnerEnabled: githubRunnerEnabledVal,
+		GitHubRepo:          githubRepoVal,
+		GitHubRunnerLabels:  githubRunnerLabelsVal,
+		GitHubAppID:         githubAppIDVal,
+		GitHubAppSecret:     githubAppSecretVal,
+		GCPProject:          gcpProjectVal,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,7 +228,7 @@ func main() {
 
 	// Register services
 	hostAgentServer := NewHostAgentServer(mgr, logger)
-	RegisterHostAgentServer(grpcServer, hostAgentServer)
+	pb.RegisterHostAgentServer(grpcServer, hostAgentServer)
 
 	// Register health service
 	healthServer := health.NewServer()
@@ -438,6 +530,27 @@ func getMetadataAttribute(attr string) string {
 	}
 
 	buf := make([]byte, 1024)
+	n, _ := resp.Body.Read(buf)
+	return string(buf[:n])
+}
+
+func getProjectMetadata() string {
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := "http://metadata.google.internal/computeMetadata/v1/project/project-id"
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	buf := make([]byte, 256)
 	n, _ := resp.Body.Read(buf)
 	return string(buf[:n])
 }

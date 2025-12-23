@@ -9,8 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -20,6 +23,7 @@ var (
 	mmdsEndpoint           = flag.String("mmds-endpoint", "http://169.254.169.254", "MMDS endpoint")
 	workspaceDir           = flag.String("workspace-dir", "/workspace", "Workspace directory")
 	runnerDir              = flag.String("runner-dir", "/home/runner", "GitHub runner directory")
+	runnerUsername         = flag.String("runner-user", "runner", "Username for GitHub runner and file ownership (e.g., 'runner' or 'gleanuser')")
 	logLevel               = flag.String("log-level", "info", "Log level")
 	readyFile              = flag.String("ready-file", "/var/run/thaw-agent/ready", "Ready signal file")
 	skipNetwork            = flag.Bool("skip-network", false, "Skip network configuration")
@@ -35,6 +39,12 @@ var (
 	buildbarnCertsDevice   = flag.String("buildbarn-certs-device", "/dev/vdd", "Block device for Buildbarn certs drive (read-only mount inside VM)")
 	buildbarnCertsMount    = flag.String("buildbarn-certs-mount", "/etc/bazel-firecracker/certs/buildbarn", "Mount point for Buildbarn certs inside the microVM")
 	buildbarnCertsLabel    = flag.String("buildbarn-certs-label", "BUILDBARN_CERTS", "Filesystem label for Buildbarn certs drive")
+
+	// Git cache flags
+	skipGitCache         = flag.Bool("skip-git-cache", false, "Skip git-cache setup and reference cloning")
+	gitCacheDevice       = flag.String("git-cache-device", "/dev/vde", "Block device for git-cache (read-only mount inside VM)")
+	gitCacheMount        = flag.String("git-cache-mount", "/mnt/git-cache", "Mount point for git-cache inside the microVM")
+	gitCacheLabel        = flag.String("git-cache-label", "GIT_CACHE", "Filesystem label for git-cache drive")
 )
 
 // MMDSData represents the data structure from MMDS
@@ -66,6 +76,12 @@ type MMDSData struct {
 		Snapshot struct {
 			Version string `json:"version"`
 		} `json:"snapshot"`
+		GitCache struct {
+			Enabled      bool              `json:"enabled"`
+			MountPath    string            `json:"mount_path,omitempty"`
+			RepoMappings map[string]string `json:"repo_mappings,omitempty"`
+			WorkspaceDir string            `json:"workspace_dir,omitempty"`
+		} `json:"git_cache,omitempty"`
 	} `json:"latest"`
 }
 
@@ -84,6 +100,22 @@ func main() {
 	log.SetLevel(level)
 
 	log.Info("Thaw agent starting...")
+
+	// Start a basic health server immediately (for debugging)
+	// This allows us to verify the agent is alive even if MMDS fails
+	go func() {
+		http.HandleFunc("/alive", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("thaw-agent alive"))
+		})
+		if err := http.ListenAndServe(":8081", nil); err != nil {
+			log.WithError(err).Debug("Early health server failed")
+		}
+	}()
+
+	// Network is configured by kernel boot parameters (ip=...), so we just need
+	// to wait briefly for the interface to be ready
+	time.Sleep(100 * time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -118,6 +150,14 @@ func main() {
 		}
 	}
 
+	// Mount git-cache for fast reference cloning
+	if !*skipGitCache && mmdsData.Latest.GitCache.Enabled {
+		log.Info("Mounting git-cache...")
+		if err := mountGitCache(mmdsData); err != nil {
+			log.WithError(err).Error("Failed to mount git-cache")
+		}
+	}
+
 	// Configure network
 	if !*skipNetwork {
 		log.Info("Configuring network...")
@@ -136,6 +176,20 @@ func main() {
 	log.Info("Resyncing clock...")
 	if err := resyncClock(); err != nil {
 		log.WithError(err).Warn("Failed to resync clock")
+	}
+
+	// Mount tmpfs for workspace if needed (rootfs is often too small)
+	if mmdsData.Latest.GitCache.WorkspaceDir != "" {
+		workspaceDir := mmdsData.Latest.GitCache.WorkspaceDir
+		if err := os.MkdirAll(workspaceDir, 0755); err == nil {
+			// Check if already mounted
+			if out, _ := exec.Command("mountpoint", "-q", workspaceDir).CombinedOutput(); len(out) > 0 || exec.Command("mountpoint", "-q", workspaceDir).Run() != nil {
+				log.WithField("path", workspaceDir).Info("Mounting tmpfs for workspace...")
+				if err := exec.Command("mount", "-t", "tmpfs", "-o", "size=3G", "tmpfs", workspaceDir).Run(); err != nil {
+					log.WithError(err).Warn("Failed to mount tmpfs for workspace")
+				}
+			}
+		}
 	}
 
 	// Sync git repository
@@ -160,7 +214,11 @@ func main() {
 		log.WithError(err).Error("Failed to signal ready")
 	}
 
-	log.Info("Thaw agent complete")
+	log.Info("Thaw agent initialization complete, starting health server...")
+
+	// Start health check HTTP server (blocking - runs indefinitely)
+	// This keeps the agent alive to serve health checks and for the manager to verify VM status
+	startHealthServer(mmdsData)
 }
 
 func setupRepoCacheOverlay() error {
@@ -218,7 +276,7 @@ func setupRepoCacheOverlay() error {
 
 	// Ensure the runner user can write into the repo cache path without recursively
 	// chowning (which would copy-up most of the seed into the upper layer).
-	_ = exec.Command("chown", "runner:runner", *repoCacheOverlayTarget).Run()
+	_ = exec.Command("chown", *runnerUsername+":"+*runnerUsername, *repoCacheOverlayTarget).Run()
 
 	log.WithFields(logrus.Fields{
 		"seed_device":  seedDev,
@@ -305,9 +363,11 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 		}
 
 		var data MMDSData
-		// MMDS returns data wrapped in "latest" key
-		if err := json.Unmarshal(body, &data); err != nil {
-			// Try unwrapping if the response is the inner structure
+		// MMDS can return data wrapped in "latest" key OR directly
+		json.Unmarshal(body, &data)
+
+		// If the "latest" wrapper wasn't present, try parsing directly as inner structure
+		if data.Latest.Meta.RunnerID == "" {
 			var inner struct {
 				Meta struct {
 					RunnerID    string `json:"runner_id"`
@@ -335,11 +395,24 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 				Snapshot struct {
 					Version string `json:"version"`
 				} `json:"snapshot"`
+				GitCache struct {
+					Enabled      bool              `json:"enabled"`
+					MountPath    string            `json:"mount_path,omitempty"`
+					RepoMappings map[string]string `json:"repo_mappings,omitempty"`
+					WorkspaceDir string            `json:"workspace_dir,omitempty"`
+				} `json:"git_cache,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
 				return nil, fmt.Errorf("failed to parse MMDS data: %w", err)
 			}
 			data.Latest = inner
+		}
+
+		// Wait until runner_id is populated - manager sets MMDS after VM boots
+		if data.Latest.Meta.RunnerID == "" {
+			log.Debug("MMDS data not fully populated yet (no runner_id), retrying...")
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
 		return &data, nil
@@ -356,6 +429,18 @@ func configureNetwork(data *MMDSData) error {
 	if iface == "" {
 		iface = "eth0"
 	}
+
+	// Check if kernel already configured the network (via ip= boot parameter)
+	// If so, skip reconfiguration to avoid disrupting connectivity
+	out, _ := exec.Command("ip", "addr", "show", "dev", iface).Output()
+	expectedIP := strings.Split(net.IP, "/")[0]
+	if strings.Contains(string(out), expectedIP) {
+		log.WithField("ip", expectedIP).Info("Network already configured by kernel, skipping")
+		return nil
+	}
+
+	// Only configure if kernel didn't set it up
+	log.Info("Configuring network from MMDS data...")
 
 	// Flush existing addresses
 	exec.Command("ip", "addr", "flush", "dev", iface).Run()
@@ -397,7 +482,15 @@ func configureNetwork(data *MMDSData) error {
 }
 
 func regenerateHostname(runnerID string) error {
-	hostname := fmt.Sprintf("runner-%s", runnerID[:8])
+	// Handle empty or short runner IDs gracefully
+	shortID := runnerID
+	if len(shortID) > 8 {
+		shortID = runnerID[:8]
+	}
+	if shortID == "" {
+		shortID = "unknown"
+	}
+	hostname := fmt.Sprintf("runner-%s", shortID)
 
 	if err := os.WriteFile("/etc/hostname", []byte(hostname+"\n"), 0644); err != nil {
 		return err
@@ -418,21 +511,76 @@ func resyncClock() error {
 	return nil
 }
 
+func mountGitCache(data *MMDSData) error {
+	mountPath := *gitCacheMount
+	if data != nil && data.Latest.GitCache.MountPath != "" {
+		mountPath = data.Latest.GitCache.MountPath
+	}
+	if mountPath == "" {
+		return nil
+	}
+
+	if err := os.MkdirAll(mountPath, 0755); err != nil {
+		return fmt.Errorf("failed to create git-cache mount dir: %w", err)
+	}
+
+	dev := resolveDevice(*gitCacheDevice, *gitCacheLabel)
+
+	// Check if already mounted
+	if err := exec.Command("mountpoint", "-q", mountPath).Run(); err == nil {
+		log.WithField("mount", mountPath).Debug("Git-cache already mounted")
+		return nil
+	}
+
+	if output, err := exec.Command("mount", "-o", "ro", dev, mountPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount failed: %s: %w", string(output), err)
+	}
+
+	log.WithFields(logrus.Fields{
+		"device": dev,
+		"mount":  mountPath,
+	}).Info("Git-cache mounted")
+	return nil
+}
+
 func syncGitRepo(data *MMDSData) error {
 	job := data.Latest.Job
 	if job.Repo == "" {
 		return nil
 	}
 
-	// Change to workspace
-	if err := os.Chdir(*workspaceDir); err != nil {
+	// Determine workspace directory
+	workspacePath := *workspaceDir
+	if data.Latest.GitCache.WorkspaceDir != "" {
+		workspacePath = data.Latest.GitCache.WorkspaceDir
+	}
+
+	// Extract repo name for directory structure
+	repoDir := extractRepoDir(job.Repo)
+	targetDir := filepath.Join(workspacePath, repoDir)
+
+	// Check if git-cache reference cloning is available
+	if data.Latest.GitCache.Enabled {
+		refPath := findGitCacheReference(data, job.Repo)
+		if refPath != "" {
+			return syncGitRepoWithReference(data, targetDir, refPath)
+		}
+		log.WithField("repo", job.Repo).Warn("Git-cache enabled but no reference found, falling back to regular clone")
+	}
+
+	// Fall back to existing behavior
+	if err := os.Chdir(workspacePath); err != nil {
 		return fmt.Errorf("failed to change to workspace: %w", err)
 	}
 
 	// Check if repo exists
-	if _, err := os.Stat(".git"); os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(targetDir, ".git")); os.IsNotExist(err) {
 		log.Warn("No git repo in workspace, skipping sync")
 		return nil
+	}
+
+	if err := os.Chdir(targetDir); err != nil {
+		return fmt.Errorf("failed to change to repo dir: %w", err)
 	}
 
 	// Fetch updates
@@ -458,6 +606,206 @@ func syncGitRepo(data *MMDSData) error {
 	return nil
 }
 
+func syncGitRepoWithReference(data *MMDSData, targetDir, refPath string) error {
+	job := data.Latest.Job
+
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(targetDir), 0755); err != nil {
+		return fmt.Errorf("failed to create parent dir: %w", err)
+	}
+
+	// Check if target already exists with .git
+	gitDir := filepath.Join(targetDir, ".git")
+	if _, err := os.Stat(gitDir); err == nil {
+		// Repo exists, just fetch and checkout
+		log.WithFields(logrus.Fields{
+			"target":    targetDir,
+			"reference": refPath,
+		}).Info("Repo exists, fetching updates with reference")
+
+		if err := os.Chdir(targetDir); err != nil {
+			return fmt.Errorf("failed to chdir: %w", err)
+		}
+
+		// Ensure alternates is set up
+		alternatesFile := filepath.Join(gitDir, "objects", "info", "alternates")
+		refObjects := filepath.Join(refPath, ".git", "objects")
+		if _, err := os.Stat(refObjects); err == nil {
+			if err := os.MkdirAll(filepath.Dir(alternatesFile), 0755); err == nil {
+				os.WriteFile(alternatesFile, []byte(refObjects+"\n"), 0644)
+			}
+		}
+
+		// Fetch
+		if err := exec.Command("git", "fetch", "origin").Run(); err != nil {
+			log.WithError(err).Warn("git fetch failed")
+		}
+	} else {
+		// Try clone with reference first
+		log.WithFields(logrus.Fields{
+			"target":    targetDir,
+			"reference": refPath,
+			"repo":      job.Repo,
+		}).Info("Cloning with git-cache reference")
+
+		repoURL := job.Repo
+		if !strings.HasPrefix(repoURL, "https://") && !strings.HasPrefix(repoURL, "git@") {
+			repoURL = "https://github.com/" + repoURL
+		}
+
+		// Build clone command with reference (no --dissociate to keep using shared objects)
+		args := []string{"clone", "--reference", refPath, repoURL, targetDir}
+
+		cmd := exec.Command("git", args...)
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if _, err := cmd.CombinedOutput(); err != nil {
+			// Fallback: local-only checkout using alternates (for private repos without auth)
+			log.WithError(err).Info("Network clone failed, trying local-only checkout from cache")
+
+			// Set up git repo with alternates pointing to cache
+			gitDir := filepath.Join(targetDir, ".git")
+			if err := os.MkdirAll(filepath.Join(gitDir, "objects", "info"), 0755); err != nil {
+				return fmt.Errorf("failed to create .git dirs: %w", err)
+			}
+
+			// Copy refs and config from cache
+			refGitDir := filepath.Join(refPath, ".git")
+			for _, f := range []string{"HEAD", "config", "packed-refs"} {
+				src := filepath.Join(refGitDir, f)
+				dst := filepath.Join(gitDir, f)
+				if data, err := os.ReadFile(src); err == nil {
+					os.WriteFile(dst, data, 0644)
+				}
+			}
+
+			// Copy refs directory
+			exec.Command("cp", "-r", filepath.Join(refGitDir, "refs"), gitDir).Run()
+
+			// Set up alternates to share objects
+			alternatesFile := filepath.Join(gitDir, "objects", "info", "alternates")
+			refObjects := filepath.Join(refGitDir, "objects")
+			os.WriteFile(alternatesFile, []byte(refObjects+"\n"), 0644)
+
+			// Checkout working tree
+			if err := os.Chdir(targetDir); err != nil {
+				return fmt.Errorf("failed to chdir: %w", err)
+			}
+
+			// Reset to HEAD to populate working tree
+			if out, err := exec.Command("git", "checkout", "HEAD", "--", ".").CombinedOutput(); err != nil {
+				return fmt.Errorf("local checkout failed: %s: %w", string(out), err)
+			}
+
+			log.Info("Local-only checkout from cache completed")
+			// Fix ownership for runner user
+			exec.Command("chown", "-R", *runnerUsername+":"+*runnerUsername, targetDir).Run()
+			return nil
+		}
+
+		if err := os.Chdir(targetDir); err != nil {
+			return fmt.Errorf("failed to chdir after clone: %w", err)
+		}
+	}
+
+	// Checkout the target branch/commit
+	target := job.Commit
+	if target == "" {
+		target = job.Branch
+		if target == "" {
+			target = "main"
+		}
+	}
+
+	// Fetch the specific branch if needed
+	if job.Branch != "" {
+		exec.Command("git", "fetch", "origin", job.Branch).Run()
+	}
+
+	log.WithField("target", target).Info("Checking out")
+	if err := exec.Command("git", "checkout", "-f", target).Run(); err != nil {
+		// Try with origin/ prefix
+		if err := exec.Command("git", "checkout", "-f", "origin/"+target).Run(); err != nil {
+			return fmt.Errorf("git checkout failed: %w", err)
+		}
+	}
+
+	// Clean workspace
+	exec.Command("git", "clean", "-fdx").Run()
+
+	// Fix ownership for runner user
+	exec.Command("chown", "-R", *runnerUsername+":"+*runnerUsername, targetDir).Run()
+
+	return nil
+}
+
+func findGitCacheReference(data *MMDSData, repoURL string) string {
+	gitCache := data.Latest.GitCache
+	if !gitCache.Enabled {
+		return ""
+	}
+
+	mountPath := gitCache.MountPath
+	if mountPath == "" {
+		mountPath = *gitCacheMount
+	}
+
+	// Check repo mappings first
+	for pattern, cacheName := range gitCache.RepoMappings {
+		if strings.Contains(repoURL, pattern) || pattern == repoURL {
+			refPath := filepath.Join(mountPath, cacheName)
+			if _, err := os.Stat(filepath.Join(refPath, ".git")); err == nil {
+				return refPath
+			}
+			// Also try bare repo
+			if _, err := os.Stat(filepath.Join(refPath, "HEAD")); err == nil {
+				return refPath
+			}
+		}
+	}
+
+	// Try to infer from repo URL - extractRepoDir returns repo/repo, we need just repo
+	repoPath := extractRepoDir(repoURL)       // scio/scio
+	repoName := filepath.Base(repoPath)       // scio
+	candidates := []string{
+		filepath.Join(mountPath, repoName),        // /mnt/git-cache/scio
+		filepath.Join(mountPath, repoName+".git"), // /mnt/git-cache/scio.git
+	}
+
+	for _, candidate := range candidates {
+		// Check for regular clone
+		if _, err := os.Stat(filepath.Join(candidate, ".git")); err == nil {
+			return candidate
+		}
+		// Check for bare repo
+		if _, err := os.Stat(filepath.Join(candidate, "HEAD")); err == nil {
+			return candidate
+		}
+	}
+
+	return ""
+}
+
+func extractRepoDir(repoURL string) string {
+	// Handle various URL formats - returns repo/repo structure for GitHub Actions compatibility
+	// GitHub Actions default checkout is: $GITHUB_WORKSPACE/{repo}/{repo}
+	// https://github.com/org/repo.git -> repo/repo
+	// askscio/scio -> scio/scio
+
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+	repoURL = strings.TrimPrefix(repoURL, "https://")
+	repoURL = strings.TrimPrefix(repoURL, "http://")
+	repoURL = strings.TrimPrefix(repoURL, "git@")
+	repoURL = strings.TrimPrefix(repoURL, "github.com/")
+	repoURL = strings.TrimPrefix(repoURL, "github.com:")
+
+	// Extract just the repo name (last part)
+	parts := strings.Split(repoURL, "/")
+	repoName := parts[len(parts)-1]
+
+	// Return repo/repo format (GitHub Actions convention)
+	return filepath.Join(repoName, repoName)
+}
+
 func registerGitHubRunner(data *MMDSData) error {
 	job := data.Latest.Job
 	if job.GitHubRunnerToken == "" {
@@ -479,7 +827,18 @@ func registerGitHubRunner(data *MMDSData) error {
 	}
 	labelsStr := strings.Join(labels, ",")
 
-	// Configure runner
+	// Get runner user UID/GID - GitHub runner refuses to run as root
+	runnerUser, err := user.Lookup(*runnerUsername)
+	if err != nil {
+		return fmt.Errorf("runner user not found: %w", err)
+	}
+	uid, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+	gid, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+
+	// Ensure runner directory is owned by runner user
+	exec.Command("chown", "-R", *runnerUsername+":"+*runnerUsername, runnerPath).Run()
+
+	// Configure runner as 'runner' user
 	configCmd := exec.Command(
 		filepath.Join(runnerPath, "config.sh"),
 		"--url", repoURL,
@@ -493,17 +852,31 @@ func registerGitHubRunner(data *MMDSData) error {
 	configCmd.Dir = runnerPath
 	configCmd.Stdout = os.Stdout
 	configCmd.Stderr = os.Stderr
+	configCmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{
+			Uid: uint32(uid),
+			Gid: uint32(gid),
+		},
+	}
+	configCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
 
 	log.Info("Configuring GitHub runner...")
 	if err := configCmd.Run(); err != nil {
 		return fmt.Errorf("runner config failed: %w", err)
 	}
 
-	// Start runner in background
+	// Start runner in background as 'runner' user
 	runCmd := exec.Command(filepath.Join(runnerPath, "run.sh"))
 	runCmd.Dir = runnerPath
 	runCmd.Stdout = os.Stdout
 	runCmd.Stderr = os.Stderr
+	runCmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{
+			Uid: uint32(uid),
+			Gid: uint32(gid),
+		},
+	}
+	runCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
 
 	log.Info("Starting GitHub runner...")
 	if err := runCmd.Start(); err != nil {
@@ -520,4 +893,56 @@ func signalReady() error {
 	}
 
 	return os.WriteFile(*readyFile, []byte(time.Now().Format(time.RFC3339)), 0644)
+}
+
+// startHealthServer starts a simple HTTP server for health checks and testing
+func startHealthServer(mmdsData *MMDSData) {
+	mux := http.NewServeMux()
+
+	// Health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":    "healthy",
+			"runner_id": mmdsData.Latest.Meta.RunnerID,
+			"uptime":    time.Since(time.Now()).String(),
+		})
+	})
+
+	// Network info endpoint
+	mux.HandleFunc("/network", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Get actual network config
+		out, _ := exec.Command("ip", "addr", "show", "eth0").Output()
+		route, _ := exec.Command("ip", "route").Output()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"configured_ip": mmdsData.Latest.Network.IP,
+			"gateway":       mmdsData.Latest.Network.Gateway,
+			"ip_addr":       string(out),
+			"routes":        string(route),
+		})
+	})
+
+	// Test internet connectivity
+	mux.HandleFunc("/connectivity", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		pingOut, pingErr := exec.Command("ping", "-c", "1", "-W", "2", "8.8.8.8").CombinedOutput()
+		dnsOut, dnsErr := exec.Command("ping", "-c", "1", "-W", "2", "google.com").CombinedOutput()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ping_8888":     pingErr == nil,
+			"ping_output":   string(pingOut),
+			"dns_works":     dnsErr == nil,
+			"dns_output":    string(dnsOut),
+		})
+	})
+
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+
+	log.Info("Starting health server on :8080")
+	if err := server.ListenAndServe(); err != nil {
+		log.WithError(err).Warn("Health server stopped")
+	}
 }

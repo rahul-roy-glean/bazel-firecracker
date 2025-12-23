@@ -148,7 +148,8 @@ func (c *Cache) loadLocalMetadata() error {
 	return nil
 }
 
-// GetSnapshotPaths returns the paths to snapshot files
+// GetSnapshotPaths returns the paths to snapshot files.
+// Kernel, rootfs, and repo-cache-seed are required; mem/state are optional (fresh boot if missing).
 func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -159,21 +160,30 @@ func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 	statePath := filepath.Join(c.localPath, "snapshot.state")
 	repoCacheSeedPath := filepath.Join(c.localPath, "repo-cache-seed.img")
 
-	// Verify files exist
-	for _, path := range []string{kernelPath, rootfsPath, memPath, statePath, repoCacheSeedPath} {
+	// Required files for any boot mode
+	for _, path := range []string{kernelPath, rootfsPath, repoCacheSeedPath} {
 		if _, err := os.Stat(path); err != nil {
-			return nil, fmt.Errorf("snapshot file not found: %s", path)
+			return nil, fmt.Errorf("required snapshot file not found: %s", path)
 		}
 	}
 
-	return &SnapshotPaths{
+	// Snapshot files are optional - if missing, caller will use fresh boot
+	paths := &SnapshotPaths{
 		Kernel:        kernelPath,
 		Rootfs:        rootfsPath,
-		Mem:           memPath,
-		State:         statePath,
 		RepoCacheSeed: repoCacheSeedPath,
 		Version:       c.currentVer,
-	}, nil
+	}
+
+	// Only include mem/state if BOTH exist (partial snapshot is invalid)
+	if _, err := os.Stat(memPath); err == nil {
+		if _, err := os.Stat(statePath); err == nil {
+			paths.Mem = memPath
+			paths.State = statePath
+		}
+	}
+
+	return paths, nil
 }
 
 // GetMetadata returns the current snapshot metadata

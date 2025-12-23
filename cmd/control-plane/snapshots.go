@@ -5,10 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 )
 
 // Snapshot represents a snapshot version
@@ -32,10 +36,12 @@ type SnapshotMetrics struct {
 
 // SnapshotManager manages snapshot lifecycle
 type SnapshotManager struct {
-	db        *sql.DB
-	gcsClient *storage.Client
-	gcsBucket string
-	logger    *logrus.Entry
+	db             *sql.DB
+	gcsClient      *storage.Client
+	gcsBucket      string
+	logger         *logrus.Entry
+	mu             sync.RWMutex
+	currentVersion string
 }
 
 // NewSnapshotManager creates a new snapshot manager
@@ -45,12 +51,31 @@ func NewSnapshotManager(ctx context.Context, db *sql.DB, gcsBucket string, logge
 		logger.WithError(err).Warn("Failed to create GCS client")
 	}
 
-	return &SnapshotManager{
+	sm := &SnapshotManager{
 		db:        db,
 		gcsClient: client,
 		gcsBucket: gcsBucket,
 		logger:    logger.WithField("component", "snapshot-manager"),
 	}
+
+	// Load current active snapshot version
+	if s, err := sm.GetCurrentSnapshot(ctx); err == nil {
+		sm.currentVersion = s.Version
+	}
+
+	return sm
+}
+
+// GetCurrentVersion returns the current active snapshot version
+func (sm *SnapshotManager) GetCurrentVersion() string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.currentVersion
+}
+
+// TriggerBuild is an alias for TriggerSnapshotBuild
+func (sm *SnapshotManager) TriggerBuild(ctx context.Context, repo, branch, bazelVersion string) (string, error) {
+	return sm.TriggerSnapshotBuild(ctx, repo, branch, bazelVersion)
 }
 
 // GetCurrentSnapshot returns the current active snapshot
@@ -291,6 +316,22 @@ func (sm *SnapshotManager) checkFreshness(ctx context.Context) {
 			"version":         current.Version,
 			"cache_hit_ratio": current.Metrics.CacheHitRatio,
 		}).Warn("Cache hit ratio degraded")
+	}
+}
+
+// SnapshotToProto converts a Snapshot to its proto representation
+func (sm *SnapshotManager) SnapshotToProto(s *Snapshot) *pb.Snapshot {
+	if s == nil {
+		return nil
+	}
+	return &pb.Snapshot{
+		Version:      s.Version,
+		Status:       s.Status,
+		GcsPath:      s.GCSPath,
+		BazelVersion: s.BazelVersion,
+		RepoCommit:   s.RepoCommit,
+		SizeBytes:    s.SizeBytes,
+		CreatedAt:    timestamppb.New(s.CreatedAt),
 	}
 }
 

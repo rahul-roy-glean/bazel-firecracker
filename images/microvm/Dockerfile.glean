@@ -1,0 +1,179 @@
+# MicroVM Rootfs - Glean CI Environment
+# Based on the same tooling as ci-runner-ubuntu-2204.pkr.hcl
+
+FROM ubuntu:22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install base packages (matching your Packer template)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    gnupg \
+    lsb-release \
+    sudo \
+    systemd \
+    systemd-sysv \
+    dbus \
+    iproute2 \
+    iputils-ping \
+    net-tools \
+    iptables \
+    procps \
+    vim-tiny \
+    less \
+    jq \
+    unzip \
+    xz-utils \
+    fuse \
+    patch \
+    zip \
+    software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add PPAs (matching your Packer setup)
+RUN add-apt-repository -y ppa:deadsnakes/ppa \
+    && add-apt-repository -y ppa:openjdk-r/ppa \
+    && add-apt-repository -y ppa:longsleep/golang-backports \
+    && add-apt-repository -y ppa:git-core/ppa
+
+# Install build tools and languages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3.10 \
+    python3.10-dev \
+    python3.10-distutils \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    openjdk-17-jdk-headless \
+    golang-1.22-go \
+    maven \
+    && rm -rf /var/lib/apt/lists/*
+
+# Setup Go
+RUN ln -s /usr/lib/go-1.22/bin/go /usr/bin/go
+
+# Install gcloud CLI
+RUN curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo 'deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main' > /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Bazelisk
+ARG BAZELISK_VERSION=1.27.0
+RUN curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-amd64" \
+    -o /usr/local/bin/bazel && chmod +x /usr/local/bin/bazel
+
+# Setup Python
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
+    && python3.12 -m pip install --upgrade pip wheel setuptools \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && ln -sf /usr/local/bin/pip3.12 /usr/bin/pip
+
+# Create runner user (matching your gleanuser)
+RUN useradd -m -s /bin/bash -G sudo gleanuser \
+    && echo "gleanuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/gleanuser \
+    && echo 'export PATH=$PATH:/home/gleanuser/.local/bin' >> /home/gleanuser/.bashrc
+
+# Install GitHub Actions Runner
+ARG RUNNER_VERSION=2.314.1
+WORKDIR /home/gleanuser
+RUN curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
+    | tar xzf - \
+    && ./bin/installdependencies.sh \
+    && chown -R gleanuser:gleanuser /home/gleanuser
+
+# Create workspace and cache directories
+RUN mkdir -p /workspace /var/run/thaw-agent /var/log/thaw-agent \
+    /mnt/ephemeral/caches/repository \
+    /mnt/ephemeral/bazel \
+    /mnt/ephemeral/output \
+    /home/scio \
+    && chown -R gleanuser:gleanuser /workspace /mnt/ephemeral /home/scio
+
+# Bazel config - repository cache on overlay mount
+RUN echo 'build --repository_cache=/mnt/ephemeral/caches/repository' > /home/gleanuser/.bazelrc \
+    && chown gleanuser:gleanuser /home/gleanuser/.bazelrc
+
+# Install crane (for OCI image operations)
+RUN curl -sL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+    | tar -xzf - -C /usr/local/bin/ crane
+
+# Install cloud-sql-proxy
+RUN curl -o /usr/local/bin/cloud-sql-proxy \
+    'https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.20.0/cloud-sql-proxy.linux.amd64' \
+    && chmod +x /usr/local/bin/cloud-sql-proxy
+
+# Install kubectl
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+    && chmod +x kubectl && mv kubectl /usr/local/bin/
+
+# Install terraform
+RUN curl -LO https://releases.hashicorp.com/terraform/1.10.4/terraform_1.10.4_linux_amd64.zip \
+    && unzip terraform_1.10.4_linux_amd64.zip && mv terraform /usr/local/bin/ && rm terraform_1.10.4_linux_amd64.zip
+
+# Install AWS CLI
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+    && unzip awscliv2.zip && ./aws/install && rm -rf aws awscliv2.zip
+
+# Install Azure CLI
+RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+
+# Configure systemd
+RUN systemctl set-default multi-user.target \
+    && systemctl mask \
+        systemd-resolved.service \
+        systemd-networkd.service \
+        systemd-networkd-wait-online.service \
+        systemd-timesyncd.service
+
+# Configure network
+COPY rootfs/etc/systemd/network/10-eth0.network /etc/systemd/network/
+RUN systemctl enable systemd-networkd
+
+# Copy thaw-agent systemd service
+COPY rootfs/etc/systemd/system/thaw-agent.service /etc/systemd/system/
+RUN systemctl enable thaw-agent.service
+
+# Copy thaw-agent binary (built in multi-stage)
+COPY --from=thaw-agent-builder /thaw-agent /usr/local/bin/thaw-agent
+
+# Configure serial console for Firecracker
+RUN echo "ttyS0" >> /etc/securetty \
+    && systemctl enable serial-getty@ttyS0.service
+
+# Set hostname
+RUN echo "glean-runner" > /etc/hostname
+
+# Configure DNS
+RUN echo "nameserver 8.8.8.8" > /etc/resolv.conf.default
+
+# Final cleanup
+RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+WORKDIR /workspace
+USER gleanuser
+
+# ============================================================================
+# Build stage for thaw-agent
+# ============================================================================
+FROM golang:1.22 AS thaw-agent-builder
+
+WORKDIR /build
+COPY cmd/thaw-agent/ ./cmd/thaw-agent/
+COPY pkg/ ./pkg/
+COPY go.mod go.sum ./
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
+
+# ============================================================================
+# Final rootfs stage
+# ============================================================================
+FROM base AS rootfs
+
+USER root
+RUN ln -sf /lib/systemd/systemd /init
+

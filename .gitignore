@@ -1,0 +1,83 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build outputs
+images/microvm/output/
+*.img
+*.bin
+
+# Terraform
+deploy/terraform/.terraform/
+deploy/terraform/.terraform.lock.hcl
+deploy/terraform/tfplan
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/*.tfvars
+!deploy/terraform/terraform.tfvars.example
+
+# Packer
+deploy/packer/*.pkr.hcl.bak
+*.box
+
+# Kubernetes secrets (generated)
+deploy/kubernetes/*-secrets.yaml
+deploy/kubernetes/*-secret.yaml
+
+# Helm
+deploy/helm/**/charts/
+deploy/helm/**/*.tgz
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets and credentials
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Go
+vendor/
+go.work
+go.work.sum
+
+# Test artifacts
+coverage.out
+coverage.html
+*.test
+*.prof
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Docker
+.docker/
+
+# Cache directories
+.cache/
+__pycache__/
+

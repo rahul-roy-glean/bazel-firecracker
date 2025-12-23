@@ -1,13 +1,12 @@
 [Match]
 Name=eth0
 
+[Link]
+# Don't block boot waiting for network
+RequiredForOnline=no
+
 [Network]
-# Network configuration is injected via MMDS and applied by thaw-agent
-# This is a fallback DHCP configuration
-DHCP=yes
-
-[DHCP]
-UseDNS=yes
-UseNTP=no
-
-
+# Network is configured by kernel boot parameters (ip=...)
+# systemd-networkd should not reconfigure the interface
+# Just keep the interface up and accept kernel config
+KeepConfiguration=yes

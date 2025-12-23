@@ -105,4 +105,41 @@ variable "gke_services_cidr" {
   default     = "10.2.0.0/16"
 }
 
+variable "use_custom_host_image" {
+  description = "Whether to use the custom Packer-built host image. Set to false for initial deployment, then true after building with Packer."
+  type        = bool
+  default     = false
+}
+
+# Git cache configuration
+variable "git_cache_enabled" {
+  description = "Enable git-cache for fast reference cloning in microVMs"
+  type        = bool
+  default     = false
+}
+
+variable "git_cache_repos" {
+  description = "Map of git repositories to cache. Key is repo URL pattern, value is cache directory name. E.g. {'github.com/org/repo': 'repo'}"
+  type        = map(string)
+  default     = {}
+}
+
+variable "git_cache_workspace_dir" {
+  description = "Target directory for cloned repos inside microVMs"
+  type        = string
+  default     = "/mnt/ephemeral/workdir"
+}
+
+variable "github_app_id" {
+  description = "GitHub App ID for generating installation tokens (for private repos)"
+  type        = string
+  default     = ""
+}
+
+variable "github_app_secret" {
+  description = "Secret Manager secret name containing GitHub App private key (for private repos)"
+  type        = string
+  default     = ""
+}
+
 

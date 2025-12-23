@@ -2,7 +2,18 @@
 # This Dockerfile builds a minimal rootfs for Firecracker microVMs
 # containing Bazel, GitHub Actions runner, and the thaw-agent
 
-FROM debian:bookworm-slim AS base
+# Build thaw-agent first (must be defined before it's used)
+FROM --platform=linux/amd64 golang:1.24 AS thaw-agent-builder
+
+WORKDIR /build
+COPY cmd/thaw-agent/ ./cmd/thaw-agent/
+COPY pkg/ ./pkg/
+COPY go.mod go.sum ./
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
+
+# Main rootfs image
+FROM --platform=linux/amd64 debian:bookworm-slim AS base
 
 # Install base packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -11,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     git \
     openssh-client \
+    openssh-server \
     gnupg \
     lsb-release \
     sudo \
@@ -40,7 +52,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Go
-ARG GO_VERSION=1.22.0
+ARG GO_VERSION=1.24.0
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xzf -
 ENV PATH="/usr/local/go/bin:${PATH}"
 
@@ -79,7 +91,6 @@ RUN echo 'build --repository_cache=/mnt/ephemeral/caches/repository' > /home/run
 RUN systemctl set-default multi-user.target \
     && systemctl mask \
         systemd-resolved.service \
-        systemd-networkd.service \
         systemd-networkd-wait-online.service \
         systemd-timesyncd.service \
         systemd-journald-audit.socket \
@@ -87,11 +98,11 @@ RUN systemctl set-default multi-user.target \
         sys-kernel-tracing.mount
 
 # Configure network
-COPY rootfs/etc/systemd/network/10-eth0.network /etc/systemd/network/
+COPY images/microvm/rootfs/etc/systemd/network/10-eth0.network /etc/systemd/network/
 RUN systemctl enable systemd-networkd
 
 # Copy thaw-agent systemd service
-COPY rootfs/etc/systemd/system/thaw-agent.service /etc/systemd/system/
+COPY images/microvm/rootfs/etc/systemd/system/thaw-agent.service /etc/systemd/system/
 RUN systemctl enable thaw-agent.service
 
 # Copy thaw-agent binary (built separately)
@@ -100,6 +111,14 @@ COPY --from=thaw-agent-builder /thaw-agent /usr/local/bin/thaw-agent
 # Configure serial console
 RUN echo "ttyS0" >> /etc/securetty \
     && systemctl enable serial-getty@ttyS0.service
+
+# Configure SSH for testing (allow root login)
+RUN mkdir -p /run/sshd /var/run/sshd \
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
+    && echo "root:firecracker" | chpasswd \
+    && ssh-keygen -A \
+    && systemctl enable ssh.service
 
 # Set hostname
 RUN echo "bazel-runner" > /etc/hostname
@@ -116,16 +135,6 @@ WORKDIR /workspace
 
 # Default user
 USER runner
-
-# Build stage for thaw-agent
-FROM golang:1.22 AS thaw-agent-builder
-
-WORKDIR /build
-COPY cmd/thaw-agent/ ./cmd/thaw-agent/
-COPY pkg/ ./pkg/
-COPY go.mod go.sum ./
-
-RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
 
 # Final stage - export rootfs
 FROM base AS rootfs

@@ -9,6 +9,9 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 )
 
 // Scheduler handles runner allocation across hosts
@@ -43,6 +46,7 @@ type AllocateRunnerResponse struct {
 	RunnerID    string
 	HostID      string
 	HostAddress string
+	InternalIP  string
 	Error       string
 }
 
@@ -69,25 +73,67 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	s.logger.WithFields(logrus.Fields{
 		"host_id":       host.ID,
 		"instance_name": host.InstanceName,
+		"grpc_address":  host.GRPCAddress,
 	}).Debug("Selected host")
 
 	// Connect to host agent
-	conn, err := grpc.Dial(host.GRPCAddress, grpc.WithInsecure())
+	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to host: %w", err)
+		return nil, fmt.Errorf("failed to connect to host %s: %w", host.GRPCAddress, err)
 	}
 	defer conn.Close()
 
-	// Call host agent to allocate runner
-	// In production, use generated client
-	// client := pb.NewHostAgentClient(conn)
-	// resp, err := client.AllocateRunner(ctx, &pb.AllocateRunnerRequest{...})
+	// Create host agent client
+	client := pb.NewHostAgentClient(conn)
 
-	// For now, return placeholder
+	// Build the proto request
+	protoReq := &pb.AllocateRunnerRequest{
+		RequestId:         req.RequestID,
+		Repo:              req.Repo,
+		Branch:            req.Branch,
+		Commit:            req.Commit,
+		Labels:            req.Labels,
+		GithubRunnerToken: req.GitHubRunnerToken,
+	}
+	if req.VCPUs > 0 || req.MemoryMB > 0 {
+		protoReq.Resources = &pb.Resources{
+			Vcpus:    int32(req.VCPUs),
+			MemoryMb: int32(req.MemoryMB),
+		}
+	}
+
+	// Call host agent to allocate runner
+	resp, err := client.AllocateRunner(ctx, protoReq)
+	if err != nil {
+		s.logger.WithError(err).WithField("host", host.InstanceName).Error("gRPC AllocateRunner failed")
+		return nil, fmt.Errorf("host agent AllocateRunner failed: %w", err)
+	}
+
+	if resp.Error != "" {
+		return &AllocateRunnerResponse{
+			HostID:      host.ID,
+			HostAddress: host.GRPCAddress,
+			Error:       resp.Error,
+		}, fmt.Errorf("host agent returned error: %s", resp.Error)
+	}
+
+	// Register runner in our registry
+	if resp.Runner != nil {
+		if err := s.hostRegistry.AddRunner(ctx, &Runner{
+			ID:         resp.Runner.Id,
+			HostID:     host.ID,
+			InternalIP: resp.Runner.InternalIp,
+			Status:     "running",
+		}); err != nil {
+			s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
+		}
+	}
+
 	return &AllocateRunnerResponse{
-		RunnerID:    "runner-placeholder",
+		RunnerID:    resp.Runner.GetId(),
 		HostID:      host.ID,
 		HostAddress: host.GRPCAddress,
+		InternalIP:  resp.Runner.GetInternalIp(),
 	}, nil
 }
 
@@ -134,9 +180,11 @@ func (s *Scheduler) scoreHost(h *Host) float64 {
 	}
 
 	// Penalize hosts with high utilization
-	utilization := float64(h.UsedSlots) / float64(h.TotalSlots)
-	if utilization > 0.8 {
-		score -= 30
+	if h.TotalSlots > 0 {
+		utilization := float64(h.UsedSlots) / float64(h.TotalSlots)
+		if utilization > 0.8 {
+			score -= 30
+		}
 	}
 
 	return score
@@ -161,18 +209,104 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	}
 
 	// Connect to host and release
-	conn, err := grpc.Dial(host.GRPCAddress, grpc.WithInsecure())
+	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to host: %w", err)
 	}
 	defer conn.Close()
 
-	// Call host agent
-	// client := pb.NewHostAgentClient(conn)
-	// _, err = client.ReleaseRunner(ctx, &pb.ReleaseRunnerRequest{...})
+	client := pb.NewHostAgentClient(conn)
+	resp, err := client.ReleaseRunner(ctx, &pb.ReleaseRunnerRequest{
+		RunnerId: runnerID,
+		Destroy:  destroy,
+	})
+	if err != nil {
+		return fmt.Errorf("host agent ReleaseRunner failed: %w", err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("host agent returned error: %s", resp.Error)
+	}
 
 	// Update registry
 	return s.hostRegistry.RemoveRunner(runnerID)
+}
+
+// QuarantineRunner quarantines a runner via its host agent
+func (s *Scheduler) QuarantineRunner(ctx context.Context, runnerID, reason string, blockEgress, pauseVM bool) (string, error) {
+	s.logger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"reason":    reason,
+	}).Info("Quarantining runner")
+
+	runner, err := s.hostRegistry.GetRunner(runnerID)
+	if err != nil {
+		return "", err
+	}
+
+	host, err := s.hostRegistry.GetHost(runner.HostID)
+	if err != nil {
+		return "", err
+	}
+
+	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to host: %w", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewHostAgentClient(conn)
+	resp, err := client.QuarantineRunner(ctx, &pb.QuarantineRunnerRequest{
+		RunnerId:    runnerID,
+		Reason:      reason,
+		BlockEgress: blockEgress,
+		PauseVm:     pauseVM,
+	})
+	if err != nil {
+		return "", fmt.Errorf("host agent QuarantineRunner failed: %w", err)
+	}
+	if resp.Error != "" {
+		return "", fmt.Errorf("host agent returned error: %s", resp.Error)
+	}
+
+	return resp.QuarantineDir, nil
+}
+
+// UnquarantineRunner unquarantines a runner via its host agent
+func (s *Scheduler) UnquarantineRunner(ctx context.Context, runnerID string, unblockEgress, resumeVM bool) error {
+	s.logger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+	}).Info("Unquarantining runner")
+
+	runner, err := s.hostRegistry.GetRunner(runnerID)
+	if err != nil {
+		return err
+	}
+
+	host, err := s.hostRegistry.GetHost(runner.HostID)
+	if err != nil {
+		return err
+	}
+
+	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("failed to connect to host: %w", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewHostAgentClient(conn)
+	resp, err := client.UnquarantineRunner(ctx, &pb.UnquarantineRunnerRequest{
+		RunnerId:      runnerID,
+		UnblockEgress: unblockEgress,
+		ResumeVm:      resumeVM,
+	})
+	if err != nil {
+		return fmt.Errorf("host agent UnquarantineRunner failed: %w", err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("host agent returned error: %s", resp.Error)
+	}
+
+	return nil
 }
 
 // GetQueueDepth returns the current queue depth

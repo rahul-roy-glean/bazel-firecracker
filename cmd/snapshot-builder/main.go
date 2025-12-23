@@ -121,19 +121,19 @@ func main() {
 		BootArgs:       "console=ttyS0 reboot=k panic=1 pci=off init=/init",
 		Drives: []firecracker.Drive{
 			{
-				DriveID:      "repo-cache-seed",
+				DriveID:      "repo_cache_seed",
 				PathOnHost:   repoCacheSeedImg,
 				IsRootDevice: false,
 				IsReadOnly:   true,
 			},
 			{
-				DriveID:      "repo-cache-upper",
+				DriveID:      "repo_cache_upper",
 				PathOnHost:   repoCacheUpperImg,
 				IsRootDevice: false,
 				IsReadOnly:   false,
 			},
 			{
-				DriveID:      "buildbarn-certs",
+				DriveID:      "buildbarn_certs",
 				PathOnHost:   buildbarnCertsImg,
 				IsRootDevice: false,
 				IsReadOnly:   true,

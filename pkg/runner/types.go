@@ -98,6 +98,17 @@ type MMDSData struct {
 		Snapshot struct {
 			Version string `json:"version"`
 		} `json:"snapshot"`
+		GitCache struct {
+			// Enabled indicates whether git-cache reference cloning is available
+			Enabled bool `json:"enabled"`
+			// MountPath is where the git-cache block device is mounted inside the microVM
+			MountPath string `json:"mount_path,omitempty"`
+			// RepoMappings maps repo URLs/names to their cache paths inside MountPath
+			// e.g. {"github.com/org/repo": "org-repo"} means /mnt/git-cache/org-repo
+			RepoMappings map[string]string `json:"repo_mappings,omitempty"`
+			// WorkspaceDir is the target directory for cloned repositories
+			WorkspaceDir string `json:"workspace_dir,omitempty"`
+		} `json:"git_cache,omitempty"`
 	} `json:"latest"`
 }
 
@@ -135,6 +146,34 @@ type HostConfig struct {
 	BridgeName        string
 	Environment       string
 	ControlPlaneAddr  string
+
+	// GitCacheEnabled enables git-cache reference cloning for faster repo setup
+	GitCacheEnabled bool
+	// GitCacheDir is the host directory containing git mirrors (e.g. /mnt/nvme/git-cache)
+	GitCacheDir string
+	// GitCacheImagePath is the path to the git-cache block device image
+	GitCacheImagePath string
+	// GitCacheMountPath is where the git-cache will be mounted inside microVMs
+	GitCacheMountPath string
+	// GitCacheRepoMappings maps repo identifiers to their cache directory names
+	// e.g. {"github.com/askscio/scio": "scio"} means cache is at GitCacheDir/scio
+	GitCacheRepoMappings map[string]string
+	// GitCacheWorkspaceDir is the target directory for cloned repos inside microVMs
+	GitCacheWorkspaceDir string
+
+	// GitHub Runner Registration (Option C: pre-register at boot)
+	// GitHubRunnerEnabled enables automatic runner registration at VM boot
+	GitHubRunnerEnabled bool
+	// GitHubRepo is the repository runners will register to (e.g., "askscio/scio")
+	GitHubRepo string
+	// GitHubRunnerLabels are labels applied to registered runners
+	GitHubRunnerLabels []string
+	// GitHubAppID is the GitHub App ID for authentication
+	GitHubAppID string
+	// GitHubAppSecret is the Secret Manager secret name containing the private key
+	GitHubAppSecret string
+	// GCPProject is the GCP project for Secret Manager access
+	GCPProject string
 }
 
 // DefaultHostConfig returns a host config with sensible defaults
@@ -157,5 +196,11 @@ func DefaultHostConfig() HostConfig {
 		ExternalInterface:         "eth0",
 		BridgeName:                "fcbr0",
 		Environment:               "dev",
+		// Git cache defaults
+		GitCacheEnabled:      false,
+		GitCacheDir:          "/mnt/nvme/git-cache",
+		GitCacheImagePath:    "/mnt/nvme/git-cache.img",
+		GitCacheMountPath:    "/mnt/git-cache",
+		GitCacheWorkspaceDir: "/mnt/ephemeral/workdir",
 	}
 }

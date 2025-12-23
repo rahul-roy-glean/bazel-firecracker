@@ -1,0 +1,144 @@
+name: Build Host Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_packer:
+        description: 'Skip Packer image build (binary only)'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  GO_VERSION: '1.22'
+  PACKER_VERSION: '1.10.0'
+
+jobs:
+  build-binary:
+    name: Build firecracker-manager
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(git describe --tags --always --dirty)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Build binary
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 make firecracker-manager
+          ls -la bin/
+
+      - name: Verify binary
+        run: |
+          file bin/firecracker-manager
+          # Should be: ELF 64-bit LSB executable, x86-64
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firecracker-manager-${{ steps.version.outputs.version }}
+          path: bin/firecracker-manager
+          retention-days: 7
+
+  build-image:
+    name: Build GCE Host Image
+    needs: build-binary
+    runs-on: ubuntu-latest
+    if: ${{ inputs.skip_packer != true }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: firecracker-manager-${{ needs.build-binary.outputs.version }}
+          path: bin/
+
+      - name: Make binary executable
+        run: chmod +x bin/firecracker-manager
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_PACKER_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Packer Init
+        working-directory: deploy/packer
+        run: packer init .
+
+      - name: Packer Validate
+        working-directory: deploy/packer
+        run: |
+          packer validate \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="firecracker_manager_binary=../../bin/firecracker-manager" \
+            host-image.pkr.hcl
+
+      - name: Packer Build
+        working-directory: deploy/packer
+        run: |
+          packer build \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="firecracker_manager_binary=../../bin/firecracker-manager" \
+            -var="zone=${{ vars.GCP_ZONE || 'us-central1-a' }}" \
+            host-image.pkr.hcl
+
+      - name: Get latest image name
+        id: image
+        run: |
+          IMAGE_NAME=$(gcloud compute images list \
+            --project=${{ vars.GCP_PROJECT_ID }} \
+            --filter="family:firecracker-host" \
+            --sort-by="~creationTimestamp" \
+            --limit=1 \
+            --format="value(name)")
+          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Built image: $IMAGE_NAME"
+
+      - name: Summary
+        run: |
+          echo "## Host Image Built :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${{ needs.build-binary.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ steps.image.outputs.image_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | \`${{ vars.GCP_PROJECT_ID }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  notify-failure:
+    name: Notify on Failure
+    needs: [build-binary, build-image]
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: Notify
+        run: |
+          echo "::error::Host image build failed. Check the logs above."
+

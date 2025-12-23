@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
@@ -29,9 +31,14 @@ type Manager struct {
 	// buildbarnCertsImage is an ext4 image containing Buildbarn certs, attached
 	// read-only to each microVM for Bazel remote cache/execution TLS config.
 	buildbarnCertsImage string
-	draining            bool
-	mu                  sync.RWMutex
-	logger              *logrus.Entry
+	// gitCacheImage is an ext4 image containing git repository mirrors, attached
+	// read-only to each microVM for fast reference cloning.
+	gitCacheImage string
+	// githubClient generates runner registration tokens for auto-registration
+	githubClient *github.TokenClient
+	draining     bool
+	mu           sync.RWMutex
+	logger       *logrus.Entry
 }
 
 type QuarantineOptions struct {
@@ -89,6 +96,32 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		return nil, fmt.Errorf("failed to prepare buildbarn certs image: %w", err)
 	}
 
+	// Check if git-cache image exists (created by startup script)
+	gitCacheImg := ""
+	if cfg.GitCacheEnabled && cfg.GitCacheImagePath != "" {
+		if _, err := os.Stat(cfg.GitCacheImagePath); err == nil {
+			gitCacheImg = cfg.GitCacheImagePath
+			logger.WithField("git_cache_image", gitCacheImg).Info("Git-cache image found")
+		} else {
+			logger.WithField("git_cache_image", cfg.GitCacheImagePath).Warn("Git-cache enabled but image not found")
+		}
+	}
+
+	// Initialize GitHub token client if runner auto-registration is enabled
+	var githubClient *github.TokenClient
+	if cfg.GitHubRunnerEnabled && cfg.GitHubAppID != "" && cfg.GitHubAppSecret != "" {
+		var err error
+		githubClient, err = github.NewTokenClient(ctx, cfg.GitHubAppID, cfg.GitHubAppSecret, cfg.GCPProject)
+		if err != nil {
+			logger.WithError(err).Warn("Failed to initialize GitHub token client - runners won't auto-register")
+		} else {
+			logger.WithFields(logrus.Fields{
+				"github_repo":   cfg.GitHubRepo,
+				"github_labels": cfg.GitHubRunnerLabels,
+			}).Info("GitHub runner auto-registration enabled")
+		}
+	}
+
 	return &Manager{
 		config:              cfg,
 		runners:             make(map[string]*Runner),
@@ -96,6 +129,8 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		snapshotCache:       cache,
 		network:             natNet,
 		buildbarnCertsImage: buildbarnCertsImg,
+		gitCacheImage:       gitCacheImg,
+		githubClient:        githubClient,
 		logger:              logger.WithField("component", "runner-manager"),
 	}, nil
 }
@@ -185,6 +220,23 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		RepoCacheUpper: repoCacheUpperPath,
 	}
 
+	// Build kernel boot args with network configuration
+	// Format: ip=<client-ip>::<gateway-ip>:<netmask>::<interface>:off
+	// This configures networking at kernel boot time, before userspace starts
+	// See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md
+	netCfg := tap.GetNetworkConfig()
+	// Extract IP without CIDR suffix (netCfg.IP is "172.16.0.2/24", we need "172.16.0.2")
+	guestIP := strings.Split(netCfg.IP, "/")[0]
+	gateway := netCfg.Gateway // e.g., "172.16.0.1"
+	netmask := netCfg.Netmask // e.g., "255.255.255.0"
+	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off", guestIP, gateway, netmask)
+
+	m.logger.WithFields(logrus.Fields{
+		"guest_ip": guestIP,
+		"gateway":  gateway,
+		"netmask":  netmask,
+	}).Debug("Configuring kernel network boot args")
+
 	// Create VM configuration
 	vmCfg := firecracker.VMConfig{
 		VMID:           runnerID,
@@ -192,6 +244,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		FirecrackerBin: m.config.FirecrackerBin,
 		KernelPath:     snapshotPaths.Kernel,
 		RootfsPath:     overlayPath,
+		BootArgs:       bootArgs,
 		VCPUs:          runner.Resources.VCPUs,
 		MemoryMB:       runner.Resources.MemoryMB,
 		NetworkIface: &firecracker.NetworkInterface{
@@ -200,29 +253,10 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			GuestMAC:    tap.MAC,
 		},
 		MMDSConfig: &firecracker.MMDSConfig{
-			Version:           "V2",
+			Version:           "V1", // V1 for simple GET requests (thaw-agent uses V1 protocol)
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives: []firecracker.Drive{
-			{
-				DriveID:      "repo-cache-seed",
-				PathOnHost:   snapshotPaths.RepoCacheSeed,
-				IsRootDevice: false,
-				IsReadOnly:   true,
-			},
-			{
-				DriveID:      "repo-cache-upper",
-				PathOnHost:   repoCacheUpperPath,
-				IsRootDevice: false,
-				IsReadOnly:   false,
-			},
-			{
-				DriveID:      "buildbarn-certs",
-				PathOnHost:   m.buildbarnCertsImage,
-				IsRootDevice: false,
-				IsReadOnly:   true,
-			},
-		},
+		Drives: m.buildDrives(snapshotPaths.RepoCacheSeed, repoCacheUpperPath),
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
 	}
@@ -234,25 +268,19 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	// Restore from snapshot
-	if err := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, false); err != nil {
+	// Use fresh boot (not snapshot restore) to ensure networking works
+	// Snapshot restore doesn't support adding network interfaces after load
+	if err := vm.Start(ctx); err != nil {
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
-		return nil, fmt.Errorf("failed to restore from snapshot: %w", err)
+		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
 
-	// Inject MMDS data before resuming the VM.
-	mmdsData := m.buildMMDSData(runner, tap, req)
+	// Inject MMDS data (VM is already running after Start())
+	mmdsData := m.buildMMDSData(ctx, runner, tap, req)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
 		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
-	}
-
-	// Resume the VM after snapshot load and MMDS injection.
-	if err := vm.Resume(ctx); err != nil {
-		vm.Stop()
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
-		return nil, fmt.Errorf("failed to resume VM: %w", err)
 	}
 
 	runner.State = StateInitializing
@@ -271,7 +299,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 }
 
 // buildMMDSData builds the MMDS data structure for a runner
-func (m *Manager) buildMMDSData(runner *Runner, tap *network.TapDevice, req AllocateRequest) MMDSData {
+func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *network.TapDevice, req AllocateRequest) MMDSData {
 	netCfg := tap.GetNetworkConfig()
 
 	var data MMDSData
@@ -291,6 +319,35 @@ func (m *Manager) buildMMDSData(runner *Runner, tap *network.TapDevice, req Allo
 	data.Latest.Job.GitHubRunnerToken = req.GitHubRunnerToken
 	data.Latest.Job.Labels = req.Labels
 	data.Latest.Snapshot.Version = runner.SnapshotVersion
+
+	// If GitHub runner auto-registration is enabled and no token provided in request,
+	// get a fresh registration token (Option C: pre-register at boot)
+	if m.githubClient != nil && req.GitHubRunnerToken == "" && m.config.GitHubRepo != "" {
+		token, err := m.githubClient.GetRunnerRegistrationToken(ctx, m.config.GitHubRepo)
+		if err != nil {
+			m.logger.WithError(err).Warn("Failed to get GitHub runner registration token")
+		} else {
+			data.Latest.Job.GitHubRunnerToken = token
+			data.Latest.Job.Repo = m.config.GitHubRepo
+			// Convert labels slice to map
+			if len(m.config.GitHubRunnerLabels) > 0 {
+				labels := make(map[string]string)
+				for _, label := range m.config.GitHubRunnerLabels {
+					labels[label] = "true"
+				}
+				data.Latest.Job.Labels = labels
+			}
+			m.logger.WithField("runner_id", runner.ID).Info("Got GitHub runner registration token for auto-registration")
+		}
+	}
+
+	// Git cache configuration
+	if m.config.GitCacheEnabled && m.gitCacheImage != "" {
+		data.Latest.GitCache.Enabled = true
+		data.Latest.GitCache.MountPath = m.config.GitCacheMountPath
+		data.Latest.GitCache.RepoMappings = m.config.GitCacheRepoMappings
+		data.Latest.GitCache.WorkspaceDir = m.config.GitCacheWorkspaceDir
+	}
 
 	return data
 }
@@ -583,6 +640,42 @@ func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpper
 	// Remove socket
 	socketPath := filepath.Join(m.config.SocketDir, runnerID+".sock")
 	os.Remove(socketPath)
+}
+
+// buildDrives constructs the list of block devices to attach to a microVM
+func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []firecracker.Drive {
+	drives := []firecracker.Drive{
+		{
+			DriveID:      "repo_cache_seed",
+			PathOnHost:   repoCacheSeedPath,
+			IsRootDevice: false,
+			IsReadOnly:   true,
+		},
+		{
+			DriveID:      "repo_cache_upper",
+			PathOnHost:   repoCacheUpperPath,
+			IsRootDevice: false,
+			IsReadOnly:   false,
+		},
+		{
+			DriveID:      "buildbarn_certs",
+			PathOnHost:   m.buildbarnCertsImage,
+			IsRootDevice: false,
+			IsReadOnly:   true,
+		},
+	}
+
+	// Add git-cache drive if enabled and available
+	if m.config.GitCacheEnabled && m.gitCacheImage != "" {
+		drives = append(drives, firecracker.Drive{
+			DriveID:      "git_cache",
+			PathOnHost:   m.gitCacheImage,
+			IsRootDevice: false,
+			IsReadOnly:   true,
+		})
+	}
+
+	return drives
 }
 
 func createExt4Image(path string, sizeGB int, label string) error {

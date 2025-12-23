@@ -197,6 +197,16 @@ func (c *Client) AddNetworkInterface(ctx context.Context, iface NetworkInterface
 	return c.doRequest(ctx, http.MethodPut, fmt.Sprintf("/network-interfaces/%s", iface.IfaceID), iface)
 }
 
+// PatchNetworkInterface patches an existing network interface (used after snapshot restore)
+func (c *Client) PatchNetworkInterface(ctx context.Context, ifaceID, hostDevName string) error {
+	c.logger.WithFields(logrus.Fields{
+		"iface_id": ifaceID,
+		"host_dev": hostDevName,
+	}).Debug("Patching network interface")
+	patch := map[string]string{"iface_id": ifaceID, "host_dev_name": hostDevName}
+	return c.doRequest(ctx, http.MethodPatch, fmt.Sprintf("/network-interfaces/%s", ifaceID), patch)
+}
+
 // SetVsock configures a vsock device for host-guest communication
 func (c *Client) SetVsock(ctx context.Context, vsock Vsock) error {
 	c.logger.WithFields(logrus.Fields{

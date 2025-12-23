@@ -30,7 +30,7 @@ provider "google-beta" {
 }
 
 locals {
-  name_prefix = "firecracker-runner-${var.environment}"
+  name_prefix = "fc-runner-${var.environment}"
 
   labels = {
     environment = var.environment
@@ -152,13 +152,7 @@ resource "google_project_iam_member" "control_plane_compute" {
 
 resource "google_project_iam_member" "control_plane_mig_admin" {
   project = var.project_id
-  role    = "roles/compute.instanceGroupManagerAdmin"
-  member  = "serviceAccount:${google_service_account.control_plane.email}"
-}
-
-resource "google_project_iam_member" "control_plane_instance_admin" {
-  project = var.project_id
-  role    = "roles/compute.instanceAdmin.v1"
+  role    = "roles/compute.admin"
   member  = "serviceAccount:${google_service_account.control_plane.email}"
 }
 

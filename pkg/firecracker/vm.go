@@ -167,6 +167,8 @@ func (vm *VM) Start(ctx context.Context) error {
 }
 
 // RestoreFromSnapshot restores the microVM from a snapshot
+// The snapshot is created WITHOUT network configuration, so we add network after loading.
+// This allows each restored VM to have its own unique TAP device.
 func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath string, resume bool) error {
 	vm.logger.WithFields(logrus.Fields{
 		"snapshot": snapshotPath,
@@ -186,85 +188,35 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 		return fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
-	// Configure logging if specified
-	if vm.config.LogPath != "" {
-		if err := vm.client.SetLogger(ctx, Logger{
-			LogPath:       vm.config.LogPath,
-			Level:         "Info",
-			ShowLevel:     true,
-			ShowLogOrigin: true,
-		}); err != nil {
-			vm.logger.WithError(err).Warn("Failed to configure logging")
-		}
-	}
-
-	// Configure metrics if specified
-	if vm.config.MetricsPath != "" {
-		if err := vm.client.SetMetrics(ctx, Metrics{
-			MetricsPath: vm.config.MetricsPath,
-		}); err != nil {
-			vm.logger.WithError(err).Warn("Failed to configure metrics")
-		}
-	}
-
-	// Set machine config. For snapshot restore, Firecracker expects the machine
-	// config to match the snapshot.
-	if err := vm.client.SetMachineConfig(ctx, MachineConfig{
-		VCPUCount:       vm.config.VCPUs,
-		MemSizeMib:      vm.config.MemoryMB,
-		TrackDirtyPages: true,
-	}); err != nil {
-		return fmt.Errorf("failed to set machine config: %w", err)
-	}
-
-	// Add root drive (must match snapshot configuration)
-	if err := vm.client.AddDrive(ctx, Drive{
-		DriveID:      "rootfs",
-		PathOnHost:   vm.config.RootfsPath,
-		IsRootDevice: true,
-		IsReadOnly:   false,
-	}); err != nil {
-		return fmt.Errorf("failed to add root drive: %w", err)
-	}
-
-	// Add additional drives (must match snapshot configuration)
-	for _, drive := range vm.config.Drives {
-		if err := vm.client.AddDrive(ctx, drive); err != nil {
-			return fmt.Errorf("failed to add drive %s: %w", drive.DriveID, err)
-		}
-	}
-
-	// Configure network interface (must match snapshot configuration)
-	if vm.config.NetworkIface != nil {
-		if err := vm.client.AddNetworkInterface(ctx, *vm.config.NetworkIface); err != nil {
-			return fmt.Errorf("failed to add network interface: %w", err)
-		}
-	}
-
-	// Configure vsock (optional)
-	if vm.config.Vsock != nil {
-		if err := vm.client.SetVsock(ctx, *vm.config.Vsock); err != nil {
-			return fmt.Errorf("failed to set vsock: %w", err)
-		}
-	}
-
-	// Configure MMDS (optional but typically required for thaw-agent)
-	if vm.config.MMDSConfig != nil {
-		if err := vm.client.SetMMDSConfig(ctx, *vm.config.MMDSConfig); err != nil {
-			return fmt.Errorf("failed to set MMDS config: %w", err)
-		}
-	}
-
-	// Load the snapshot
+	// Load the snapshot (created without network)
+	// Don't resume yet - we need to add network interface first
 	if err := vm.client.LoadSnapshot(ctx, SnapshotLoadParams{
 		SnapshotPath: snapshotPath,
 		MemBackend: &MemBackend{
 			BackendPath: memPath,
 			BackendType: "File",
 		},
-		ResumeVM: resume,
+		ResumeVM: false, // Don't resume yet
 	}); err != nil {
 		return fmt.Errorf("failed to load snapshot: %w", err)
+	}
+
+	// Add network interface after snapshot load (snapshot was created without network)
+	if vm.config.NetworkIface != nil {
+		vm.logger.WithFields(logrus.Fields{
+			"iface_id": vm.config.NetworkIface.IfaceID,
+			"host_dev": vm.config.NetworkIface.HostDevName,
+		}).Info("Adding network interface after snapshot restore")
+		if err := vm.client.AddNetworkInterface(ctx, *vm.config.NetworkIface); err != nil {
+			vm.logger.WithError(err).Warn("Failed to add network interface (VM will run without network)")
+		}
+	}
+
+	// Now resume the VM if requested
+	if resume {
+		if err := vm.client.ResumeVM(ctx); err != nil {
+			return fmt.Errorf("failed to resume VM: %w", err)
+		}
 	}
 
 	vm.logger.Info("MicroVM restored from snapshot successfully")

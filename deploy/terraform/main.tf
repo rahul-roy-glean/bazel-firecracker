@@ -50,6 +50,7 @@ resource "google_project_service" "apis" {
     "logging.googleapis.com",
     "servicenetworking.googleapis.com",
     "cloudresourcemanager.googleapis.com",
+    "artifactregistry.googleapis.com",
   ])
 
   service            = each.value
@@ -61,7 +62,7 @@ resource "google_storage_bucket" "snapshots" {
   name          = "${var.project_id}-firecracker-snapshots"
   location      = var.region
   storage_class = "STANDARD"
-  force_destroy = false
+  force_destroy = true  # Set to false in production
 
   versioning {
     enabled = true
@@ -141,6 +142,26 @@ resource "google_project_iam_member" "host_logs" {
   project = var.project_id
   role    = "roles/logging.logWriter"
   member  = "serviceAccount:${google_service_account.host_agent.email}"
+}
+
+# Artifact Registry for container images
+resource "google_artifact_registry_repository" "containers" {
+  location      = var.container_registry_location
+  repository_id = var.container_registry_repo_name
+  description   = "Container images for Firecracker runner"
+  format        = "DOCKER"
+
+  labels = local.labels
+
+  depends_on = [google_project_service.apis]
+}
+
+# IAM for GKE nodes to pull images from Artifact Registry
+resource "google_artifact_registry_repository_iam_member" "gke_reader" {
+  location   = google_artifact_registry_repository.containers.location
+  repository = google_artifact_registry_repository.containers.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
 # IAM for control plane

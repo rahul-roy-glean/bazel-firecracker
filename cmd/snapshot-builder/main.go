@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -106,9 +111,23 @@ func main() {
 		log.WithError(err).Fatal("Failed to create buildbarn-certs image")
 	}
 
-	// Create VM for warmup
+	// Create TAP device for warmup VM networking
 	vmID := "snapshot-builder"
-	socketPath := filepath.Join(*outputDir, "firecracker.sock")
+	tapName := "tap-warmup"
+	guestIP := "172.16.0.2"
+	guestMAC := "AA:FC:00:00:00:01"
+	hostIP := "172.16.0.1"
+	netmask := "255.255.255.0"
+	
+	log.Info("Setting up network for warmup VM...")
+	if err := setupWarmupNetwork(tapName, hostIP); err != nil {
+		log.WithError(err).Fatal("Failed to setup warmup network")
+	}
+	defer cleanupWarmupNetwork(tapName)
+	
+	// Build kernel boot args with network configuration
+	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off", 
+		guestIP, hostIP, netmask)
 
 	vmCfg := firecracker.VMConfig{
 		VMID:           vmID,
@@ -118,13 +137,22 @@ func main() {
 		RootfsPath:     workingRootfs,
 		VCPUs:          *vcpus,
 		MemoryMB:       *memoryMB,
-		BootArgs:       "console=ttyS0 reboot=k panic=1 pci=off init=/init",
+		BootArgs:       bootArgs,
+		NetworkIface: &firecracker.NetworkInterface{
+			IfaceID:     "eth0",
+			HostDevName: tapName,
+			GuestMAC:    guestMAC,
+		},
+		MMDSConfig: &firecracker.MMDSConfig{
+			Version:           "V1",
+			NetworkInterfaces: []string{"eth0"},
+		},
 		Drives: []firecracker.Drive{
 			{
 				DriveID:      "repo_cache_seed",
 				PathOnHost:   repoCacheSeedImg,
 				IsRootDevice: false,
-				IsReadOnly:   true,
+				IsReadOnly:   false, // Writable during warmup to populate cache
 			},
 			{
 				DriveID:      "repo_cache_upper",
@@ -151,13 +179,20 @@ func main() {
 	if err := vm.Start(ctx); err != nil {
 		log.WithError(err).Fatal("Failed to start VM")
 	}
+	
+	// Inject MMDS data for warmup configuration
+	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion)
+	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
+		vm.Stop()
+		log.WithError(err).Fatal("Failed to set MMDS data")
+	}
 
 	// Wait for VM to boot and run warmup
 	log.Info("Waiting for warmup to complete...")
 	warmupCtx, warmupCancel := context.WithTimeout(ctx, *warmupTimeout)
 	defer warmupCancel()
 
-	if err := waitForWarmup(warmupCtx, vm, log); err != nil {
+	if err := waitForWarmup(warmupCtx, vm, guestIP, log); err != nil {
 		vm.Stop()
 		log.WithError(err).Fatal("Warmup failed")
 	}
@@ -232,34 +267,171 @@ func main() {
 	}).Info("Snapshot build complete!")
 
 	// Cleanup
+	socketPath := filepath.Join(*outputDir, vmID+".sock")
 	os.Remove(socketPath)
 }
 
-func waitForWarmup(ctx context.Context, vm *firecracker.VM, log *logrus.Entry) error {
-	// In a real implementation, this would:
-	// 1. Connect to the VM via vsock or serial console
-	// 2. Wait for the warmup script to complete
-	// 3. Check for /var/run/warmup_complete marker
+// WarmupConfig holds configuration for the warmup phase
+type WarmupConfig struct {
+	RepoURL       string
+	RepoBranch    string
+	BazelVersion  string
+	WarmupTargets string
+}
 
-	// For now, just wait a fixed time
-	log.Info("Waiting for warmup (placeholder)...")
+// WarmupMMDSData is the MMDS data structure for warmup VM
+type WarmupMMDSData struct {
+	Latest struct {
+		Meta struct {
+			Mode        string `json:"mode"`
+			RunnerID    string `json:"runner_id"`
+			Environment string `json:"environment"`
+		} `json:"meta"`
+		Warmup struct {
+			RepoURL       string `json:"repo_url"`
+			RepoBranch    string `json:"repo_branch"`
+			BazelVersion  string `json:"bazel_version"`
+			WarmupTargets string `json:"warmup_targets"`
+		} `json:"warmup"`
+	} `json:"latest"`
+}
 
+func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log *logrus.Entry) error {
+	// Wait for thaw-agent health endpoint to become available
+	// The thaw-agent runs warmup and exposes /health and /warmup-status endpoints
+	
+	log.WithField("guest_ip", guestIP).Info("Waiting for warmup to complete...")
+	
+	healthURL := fmt.Sprintf("http://%s:8080/health", guestIP)
+	warmupURL := fmt.Sprintf("http://%s:8080/warmup-status", guestIP)
+	
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout: 2 * time.Second,
+			}).DialContext,
+		},
+	}
+	
+	// Phase 1: Wait for VM to boot and thaw-agent to start
+	log.Info("Phase 1: Waiting for thaw-agent to become responsive...")
+	bootCtx, bootCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer bootCancel()
+	
+	if err := waitForHealth(bootCtx, client, healthURL, log); err != nil {
+		return fmt.Errorf("VM failed to boot: %w", err)
+	}
+	log.Info("Thaw-agent is responsive")
+	
+	// Phase 2: Wait for warmup to complete
+	log.Info("Phase 2: Waiting for warmup to complete...")
+	
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-
-	timeout := time.After(5 * time.Minute)
-
+	
+	lastPhase := ""
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-timeout:
-			log.Info("Warmup timeout reached, assuming complete")
-			return nil
 		case <-ticker.C:
-			log.Debug("Warmup still in progress...")
+			status, err := getWarmupStatus(client, warmupURL)
+			if err != nil {
+				// Warmup endpoint might not exist yet, check health instead
+				if _, healthErr := checkHealth(client, healthURL); healthErr != nil {
+					log.WithError(healthErr).Warn("Lost connection to VM")
+				}
+				continue
+			}
+			
+			if status.Phase != lastPhase {
+				log.WithFields(logrus.Fields{
+					"phase":   status.Phase,
+					"message": status.Message,
+				}).Info("Warmup progress")
+				lastPhase = status.Phase
+			}
+			
+			if status.Complete {
+				log.WithFields(logrus.Fields{
+					"duration":  status.Duration,
+					"externals": status.ExternalsFetched,
+				}).Info("Warmup completed successfully")
+				return nil
+			}
+			
+			if status.Error != "" {
+				return fmt.Errorf("warmup failed: %s", status.Error)
+			}
 		}
 	}
+}
+
+func waitForHealth(ctx context.Context, client *http.Client, healthURL string, log *logrus.Entry) error {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if _, err := checkHealth(client, healthURL); err == nil {
+				return nil
+			}
+			log.Debug("Waiting for thaw-agent...")
+		}
+	}
+}
+
+func checkHealth(client *http.Client, url string) (map[string]interface{}, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("health check returned %d", resp.StatusCode)
+	}
+	
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	
+	return result, nil
+}
+
+// WarmupStatus represents the warmup status from thaw-agent
+type WarmupStatus struct {
+	Complete         bool   `json:"complete"`
+	Phase            string `json:"phase"`
+	Message          string `json:"message,omitempty"`
+	Error            string `json:"error,omitempty"`
+	Duration         string `json:"duration,omitempty"`
+	ExternalsFetched int    `json:"externals_fetched,omitempty"`
+}
+
+func getWarmupStatus(client *http.Client, url string) (*WarmupStatus, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("warmup status returned %d: %s", resp.StatusCode, string(body))
+	}
+	
+	var status WarmupStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, err
+	}
+	
+	return &status, nil
 }
 
 func copyFile(src, dst string) error {
@@ -344,5 +516,81 @@ func getGitCommit(dir string) string {
 	if err != nil {
 		return "unknown"
 	}
-	return string(out[:40])
+	commit := strings.TrimSpace(string(out))
+	if len(commit) > 40 {
+		return commit[:40]
+	}
+	return commit
+}
+
+// setupWarmupNetwork creates the TAP device and configures host networking
+func setupWarmupNetwork(tapName, hostIP string) error {
+	// Create TAP device
+	if output, err := exec.Command("ip", "tuntap", "add", "dev", tapName, "mode", "tap").CombinedOutput(); err != nil {
+		// Might already exist, try to continue
+		if !strings.Contains(string(output), "exists") {
+			return fmt.Errorf("failed to create tap: %s: %w", string(output), err)
+		}
+	}
+	
+	// Configure TAP IP
+	if output, err := exec.Command("ip", "addr", "add", hostIP+"/24", "dev", tapName).CombinedOutput(); err != nil {
+		if !strings.Contains(string(output), "exists") {
+			return fmt.Errorf("failed to add ip: %s: %w", string(output), err)
+		}
+	}
+	
+	// Bring TAP up
+	if output, err := exec.Command("ip", "link", "set", tapName, "up").CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to bring tap up: %s: %w", string(output), err)
+	}
+	
+	// Enable IP forwarding
+	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
+	
+	// Setup NAT for outbound traffic (guest needs internet for warmup)
+	exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.16.0.0/24", "-j", "MASQUERADE").Run()
+	exec.Command("iptables", "-A", "FORWARD", "-i", tapName, "-j", "ACCEPT").Run()
+	exec.Command("iptables", "-A", "FORWARD", "-o", tapName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
+	
+	return nil
+}
+
+// cleanupWarmupNetwork removes the TAP device and iptables rules
+func cleanupWarmupNetwork(tapName string) {
+	exec.Command("ip", "link", "set", tapName, "down").Run()
+	exec.Command("ip", "tuntap", "del", "dev", tapName, "mode", "tap").Run()
+	exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "172.16.0.0/24", "-j", "MASQUERADE").Run()
+	exec.Command("iptables", "-D", "FORWARD", "-i", tapName, "-j", "ACCEPT").Run()
+	exec.Command("iptables", "-D", "FORWARD", "-o", tapName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
+}
+
+// buildWarmupMMDS creates the MMDS data for warmup mode
+func buildWarmupMMDS(repoURL, repoBranch, bazelVersion string) map[string]interface{} {
+	return map[string]interface{}{
+		"latest": map[string]interface{}{
+			"meta": map[string]interface{}{
+				"mode":        "warmup",
+				"runner_id":   "snapshot-builder",
+				"environment": "snapshot-build",
+			},
+			"warmup": map[string]interface{}{
+				"repo_url":       repoURL,
+				"repo_branch":    repoBranch,
+				"bazel_version":  bazelVersion,
+				"warmup_targets": "//...",
+			},
+			"network": map[string]interface{}{
+				"ip":        "172.16.0.2/24",
+				"gateway":   "172.16.0.1",
+				"netmask":   "255.255.255.0",
+				"dns":       "8.8.8.8",
+				"interface": "eth0",
+			},
+			"job": map[string]interface{}{
+				"repo":   repoURL,
+				"branch": repoBranch,
+			},
+		},
+	}
 }

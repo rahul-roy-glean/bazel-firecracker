@@ -26,6 +26,7 @@ import (
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 var (
@@ -62,12 +63,17 @@ var (
 	gitCacheWorkspaceDir = flag.String("git-cache-workspace", "/mnt/ephemeral/workdir", "Target directory for cloned repos inside microVMs")
 
 	// GitHub runner auto-registration flags (Option C)
-	githubRunnerEnabled = flag.Bool("github-runner-enabled", false, "Enable automatic GitHub runner registration at VM boot")
-	githubRepo          = flag.String("github-repo", "", "GitHub repository for runner registration (e.g., askscio/scio)")
-	githubRunnerLabels  = flag.String("github-runner-labels", "self-hosted,firecracker,Linux,X64", "Comma-separated runner labels")
-	githubAppID         = flag.String("github-app-id", "", "GitHub App ID for authentication")
-	githubAppSecret     = flag.String("github-app-secret", "", "Secret Manager secret name containing GitHub App private key")
-	gcpProject          = flag.String("gcp-project", "", "GCP project for Secret Manager")
+	githubRunnerEnabled   = flag.Bool("github-runner-enabled", false, "Enable automatic GitHub runner registration at VM boot")
+	githubRepo            = flag.String("github-repo", "", "GitHub repository for runner registration (e.g., askscio/scio)")
+	githubRunnerLabels    = flag.String("github-runner-labels", "self-hosted,firecracker,Linux,X64", "Comma-separated runner labels")
+	githubRunnerEphemeral = flag.Bool("runner-ephemeral", true, "Whether runners are ephemeral (one job per VM) or persistent")
+	githubAppID           = flag.String("github-app-id", "", "GitHub App ID for authentication")
+	githubAppSecret       = flag.String("github-app-secret", "", "Secret Manager secret name containing GitHub App private key")
+	gcpProject            = flag.String("gcp-project", "", "GCP project for Secret Manager")
+
+	// Telemetry flags
+	telemetryEnabled = flag.Bool("telemetry-enabled", true, "Enable GCP Cloud Monitoring telemetry")
+	telemetryPrefix  = flag.String("telemetry-prefix", "custom.googleapis.com/firecracker", "Custom metric prefix for Cloud Monitoring")
 )
 
 func main() {
@@ -167,6 +173,12 @@ func main() {
 		}
 	}
 
+	// Parse runner ephemeral setting (defaults to true)
+	runnerEphemeralVal := *githubRunnerEphemeral
+	if ephemeralStr := getMetadataAttribute("runner-ephemeral"); ephemeralStr != "" {
+		runnerEphemeralVal = strings.ToLower(ephemeralStr) == "true"
+	}
+
 	// Create runner manager config
 	cfg := runner.HostConfig{
 		HostID:                    hostID,
@@ -200,12 +212,13 @@ func main() {
 		GitCacheRepoMappings: gitCacheRepoMappings,
 		GitCacheWorkspaceDir: *gitCacheWorkspaceDir,
 		// GitHub runner auto-registration (Option C)
-		GitHubRunnerEnabled: githubRunnerEnabledVal,
-		GitHubRepo:          githubRepoVal,
-		GitHubRunnerLabels:  githubRunnerLabelsVal,
-		GitHubAppID:         githubAppIDVal,
-		GitHubAppSecret:     githubAppSecretVal,
-		GCPProject:          gcpProjectVal,
+		GitHubRunnerEnabled:   githubRunnerEnabledVal,
+		GitHubRepo:            githubRepoVal,
+		GitHubRunnerLabels:    githubRunnerLabelsVal,
+		GitHubRunnerEphemeral: runnerEphemeralVal,
+		GitHubAppID:           githubAppIDVal,
+		GitHubAppSecret:       githubAppSecretVal,
+		GCPProject:            gcpProjectVal,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -218,7 +231,34 @@ func main() {
 	}
 	defer mgr.Close()
 
-	// Register metrics
+	// Initialize telemetry
+	telemetryCfg := telemetry.Config{
+		Enabled:      *telemetryEnabled,
+		ProjectID:    gcpProjectVal,
+		MetricPrefix: *telemetryPrefix,
+		Component:    "firecracker-manager",
+		Environment:  *environment,
+		InstanceName: instanceName,
+		Zone:         zone,
+	}
+	// Override from metadata if set
+	if v := getMetadataAttribute("telemetry-enabled"); v != "" {
+		telemetryCfg.Enabled = strings.ToLower(v) == "true"
+	}
+
+	var metricsClient *telemetry.Client
+	if telemetryCfg.Enabled && telemetryCfg.ProjectID != "" {
+		var telErr error
+		metricsClient, telErr = telemetry.NewClient(ctx, telemetryCfg, logger)
+		if telErr != nil {
+			log.WithError(telErr).Warn("Failed to initialize telemetry, continuing without metrics")
+		} else {
+			defer metricsClient.Close()
+			log.Info("GCP Cloud Monitoring telemetry initialized")
+		}
+	}
+
+	// Register Prometheus metrics (legacy, for Prometheus scraping if still needed)
 	metrics.RegisterHostMetrics()
 
 	// Create gRPC server
@@ -258,6 +298,7 @@ func main() {
 	httpMux.Handle("/metrics", promhttp.Handler())
 	httpMux.HandleFunc("/api/v1/runners/quarantine", quarantineRunnerHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", unquarantineRunnerHandler(mgr, logger))
+	httpMux.HandleFunc("/snapshot/sync", snapshotSyncHandler(mgr, logger))
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
@@ -272,11 +313,11 @@ func main() {
 	}()
 
 	// Start autoscaler loop
-	go autoscaleLoop(ctx, mgr, *idleTarget, logger)
+	go autoscaleLoop(ctx, mgr, *idleTarget, logger, metricsClient)
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
-		go heartbeatLoop(ctx, mgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger)
+		go heartbeatLoop(ctx, mgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, metricsClient)
 	}
 
 	// Wait for shutdown signal
@@ -318,7 +359,46 @@ func readyHandler(mgr *runner.Manager) http.HandlerFunc {
 	}
 }
 
-func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, logger *logrus.Logger) {
+func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
+	log := logger.WithField("handler", "snapshot-sync")
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Get version from header or query param
+		version := r.Header.Get("X-Snapshot-Version")
+		if version == "" {
+			version = r.URL.Query().Get("version")
+		}
+		if version == "" {
+			version = "current" // Default to "current" folder in GCS
+		}
+
+		log.WithField("version", version).Info("Snapshot sync requested")
+
+		// Sync snapshot in background to avoid blocking the HTTP request
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+
+			if err := mgr.SyncSnapshot(ctx, version); err != nil {
+				log.WithError(err).Error("Failed to sync snapshot")
+			} else {
+				log.WithField("version", version).Info("Snapshot sync completed")
+			}
+		}()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "syncing",
+			"version": version,
+		})
+	}
+}
+
+func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "autoscaler")
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -333,19 +413,46 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, log
 			// Maintain idle target
 			if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
 				log.Debug("Adding runner to maintain idle pool")
+				allocTimer := telemetry.NewStopwatch()
 				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
 				if err != nil {
 					log.WithError(err).Warn("Failed to allocate idle runner")
+					if metricsClient != nil {
+						metricsClient.IncrementCounter(ctx, telemetry.MetricVMAllocations, telemetry.Labels{
+							telemetry.LabelResult: telemetry.ResultFailure,
+							telemetry.LabelReason: "idle_pool",
+						})
+					}
+				} else {
+					if metricsClient != nil {
+						metricsClient.RecordDuration(ctx, telemetry.MetricVMBootDuration, allocTimer.Elapsed(), telemetry.Labels{
+							telemetry.LabelReason: "idle_pool",
+						})
+						metricsClient.IncrementCounter(ctx, telemetry.MetricVMAllocations, telemetry.Labels{
+							telemetry.LabelResult: telemetry.ResultSuccess,
+							telemetry.LabelReason: "idle_pool",
+						})
+					}
 				}
 			}
 
-			// Update metrics
+			// Update Prometheus metrics (legacy)
 			metrics.UpdateHostMetrics(
 				status.TotalSlots,
 				status.UsedSlots,
 				status.IdleRunners,
 				status.BusyRunners,
 			)
+
+			// Record GCP Cloud Monitoring metrics
+			if metricsClient != nil {
+				metricsClient.RecordHostMetrics(ctx, telemetry.HostMetrics{
+					TotalSlots:  status.TotalSlots,
+					UsedSlots:   status.UsedSlots,
+					IdleRunners: status.IdleRunners,
+					BusyRunners: status.BusyRunners,
+				})
+			}
 		}
 	}
 }
@@ -369,7 +476,7 @@ type hostHeartbeatResponse struct {
 	Error        string `json:"error,omitempty"`
 }
 
-func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger) {
+func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "heartbeat")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -393,6 +500,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			hbTimer := telemetry.NewStopwatch()
 			status := mgr.GetStatus()
 			reqBody := hostHeartbeatRequest{
 				InstanceName:    instanceName,
@@ -422,6 +530,11 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
+			// Record heartbeat latency
+			if metricsClient != nil {
+				metricsClient.RecordDuration(ctx, telemetry.MetricHostHeartbeatLatency, hbTimer.Elapsed(), nil)
+			}
+
 			if resp.StatusCode >= 400 {
 				log.WithFields(logrus.Fields{
 					"status": resp.StatusCode,
@@ -444,6 +557,16 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 			if changed {
 				if hbResp.ShouldDrain {
 					wasDraining = true
+					
+					// Remove labels from GitHub runners to prevent new jobs being scheduled
+					labelsRemoved, err := mgr.RemoveRunnerLabels(ctx)
+					if err != nil {
+						log.WithError(err).WithField("labels_removed", labelsRemoved).Warn("Failed to remove some runner labels")
+					} else if labelsRemoved > 0 {
+						log.WithField("labels_removed", labelsRemoved).Info("Removed labels from GitHub runners")
+					}
+					
+					// Drain idle runners (terminate them)
 					drained, err := mgr.DrainIdleRunners(ctx)
 					if err != nil {
 						log.WithError(err).WithField("drained_idle_runners", drained).Warn("Failed to drain idle runners")
@@ -455,8 +578,8 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 					log.Info("Host exited draining mode")
 				}
 			} else if hbResp.ShouldDrain && !wasDraining {
-				// Defensive: if we missed a transition, ensure we drain once.
 				wasDraining = true
+				_, _ = mgr.RemoveRunnerLabels(ctx)
 				_, _ = mgr.DrainIdleRunners(ctx)
 			}
 		}

@@ -6,7 +6,9 @@ namespace:
   name: firecracker-runner
 
 image:
-  repository: gcr.io/your-project-id/firecracker-control-plane
+  # Default uses Artifact Registry. Override with --set or values file.
+  # Format: REGION-docker.pkg.dev/PROJECT_ID/REPO_NAME/IMAGE
+  repository: us-central1-docker.pkg.dev/scio-ci/firecracker/control-plane
   tag: latest
   pullPolicy: IfNotPresent
 
@@ -40,7 +42,7 @@ containerSecurityContext: {}
 
 config:
   # Used by the control plane for snapshot versioning/artifacts.
-  gcsBucket: your-project-id-firecracker-snapshots
+  gcsBucket: scio-ci-firecracker-snapshots
 
   # Optional: used for future config expansion; control-plane currently reads env vars.
   configYaml: |
@@ -73,10 +75,10 @@ env:
 
 gcp:
   # Required for safe scale-down (control plane deletes specific MIG instances).
-  projectId: your-project-id
+  projectId: scio-ci
   region: us-central1
-  hostMigName: firecracker-runner-dev-hosts
-  hostAutoscalerName: firecracker-runner-dev-hosts-autoscaler
+  hostMigName: fc-runner-dev-hosts
+  hostAutoscalerName: fc-runner-dev-hosts-autoscaler
 
 downscaler:
   enabled: true

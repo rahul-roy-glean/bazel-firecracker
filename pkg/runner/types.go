@@ -95,6 +95,9 @@ type MMDSData struct {
 			GitHubRunnerToken string            `json:"github_runner_token"`
 			Labels            map[string]string `json:"labels"`
 		} `json:"job"`
+		Runner struct {
+			Ephemeral bool `json:"ephemeral"`
+		} `json:"runner,omitempty"`
 		Snapshot struct {
 			Version string `json:"version"`
 		} `json:"snapshot"`
@@ -168,6 +171,8 @@ type HostConfig struct {
 	GitHubRepo string
 	// GitHubRunnerLabels are labels applied to registered runners
 	GitHubRunnerLabels []string
+	// GitHubRunnerEphemeral controls whether runners exit after one job (true) or persist (false)
+	GitHubRunnerEphemeral bool
 	// GitHubAppID is the GitHub App ID for authentication
 	GitHubAppID string
 	// GitHubAppSecret is the Secret Manager secret name containing the private key

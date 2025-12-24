@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 var (
@@ -36,6 +38,11 @@ var (
 	dbSSLMode  = flag.String("db-ssl-mode", "disable", "Database SSL mode")
 	gcsBucket  = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
 	logLevel   = flag.String("log-level", "info", "Log level")
+
+	// Telemetry
+	telemetryEnabled = flag.Bool("telemetry-enabled", true, "Enable GCP Cloud Monitoring telemetry")
+	gcpProject       = flag.String("gcp-project", "", "GCP project for telemetry")
+	environment      = flag.String("environment", "dev", "Environment name for telemetry labels")
 )
 
 func main() {
@@ -105,6 +112,39 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Initialize telemetry
+	telemetryEnabledVal := *telemetryEnabled
+	if v := os.Getenv("TELEMETRY_ENABLED"); v != "" {
+		telemetryEnabledVal = strings.ToLower(v) == "true"
+	}
+	gcpProjectVal := *gcpProject
+	if v := os.Getenv("GCP_PROJECT_ID"); v != "" {
+		gcpProjectVal = v
+	}
+	envVal := *environment
+	if v := os.Getenv("ENVIRONMENT"); v != "" {
+		envVal = v
+	}
+
+	var metricsClient *telemetry.Client
+	if telemetryEnabledVal && gcpProjectVal != "" {
+		telemetryCfg := telemetry.Config{
+			Enabled:      true,
+			ProjectID:    gcpProjectVal,
+			MetricPrefix: "custom.googleapis.com/firecracker",
+			Component:    "control-plane",
+			Environment:  envVal,
+		}
+		var telErr error
+		metricsClient, telErr = telemetry.NewClient(ctx, telemetryCfg, logger)
+		if telErr != nil {
+			log.WithError(telErr).Warn("Failed to initialize telemetry, continuing without metrics")
+		} else {
+			defer metricsClient.Close()
+			log.Info("GCP Cloud Monitoring telemetry initialized")
+		}
+	}
+
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
 	scheduler := NewScheduler(hostRegistry, logger)
@@ -119,7 +159,7 @@ func main() {
 	grpcServer := grpc.NewServer()
 
 	// Register services
-	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, logger)
+	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, metricsClient, logger)
 	pb.RegisterControlPlaneServer(grpcServer, controlPlaneServer)
 
 	// Register health service
@@ -173,6 +213,9 @@ func main() {
 	go hostRegistry.HealthCheckLoop(ctx)
 	go snapshotManager.FreshnessCheckLoop(ctx)
 	go startDownscaler(ctx, db, hostRegistry, logger)
+	if metricsClient != nil {
+		go controlPlaneMetricsLoop(ctx, hostRegistry, snapshotManager, metricsClient, logger)
+	}
 
 	// Wait for shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -265,14 +308,16 @@ type ControlPlaneServer struct {
 	scheduler       *Scheduler
 	hostRegistry    *HostRegistry
 	snapshotManager *SnapshotManager
+	metricsClient   *telemetry.Client
 	logger          *logrus.Entry
 }
 
-func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, l *logrus.Logger) *ControlPlaneServer {
+func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, mc *telemetry.Client, l *logrus.Logger) *ControlPlaneServer {
 	return &ControlPlaneServer{
 		scheduler:       s,
 		hostRegistry:    h,
 		snapshotManager: sm,
+		metricsClient:   mc,
 		logger:          l.WithField("service", "control-plane"),
 	}
 }
@@ -426,4 +471,67 @@ func (s *ControlPlaneServer) HandleGetSnapshots(w http.ResponseWriter, r *http.R
 func (s *ControlPlaneServer) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	handler := NewGitHubWebhookHandler(s.scheduler, s.hostRegistry, s.logger.Logger)
 	handler.HandleWebhook(w, r)
+}
+
+// controlPlaneMetricsLoop periodically records control plane metrics to GCP Cloud Monitoring
+func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sm *SnapshotManager, mc *telemetry.Client, logger *logrus.Logger) {
+	log := logger.WithField("component", "metrics-loop")
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			hosts := hr.GetAllHosts()
+
+			// Aggregate host counts by status
+			statusCounts := map[string]int64{}
+			totalRunners := int64(0)
+			totalIdle := int64(0)
+			totalBusy := int64(0)
+
+			for _, h := range hosts {
+				statusCounts[h.Status]++
+				totalRunners += int64(h.IdleRunners + h.BusyRunners)
+				totalIdle += int64(h.IdleRunners)
+				totalBusy += int64(h.BusyRunners)
+			}
+
+			// Record host counts by status
+			for status, count := range statusCounts {
+				mc.RecordInt(ctx, telemetry.MetricCPHostsTotal, count, telemetry.Labels{
+					telemetry.LabelStatus: status,
+				})
+			}
+
+			// Record runner totals
+			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalRunners, telemetry.Labels{
+				telemetry.LabelStatus: "total",
+			})
+			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalIdle, telemetry.Labels{
+				telemetry.LabelStatus: "idle",
+			})
+			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalBusy, telemetry.Labels{
+				telemetry.LabelStatus: "busy",
+			})
+
+			// Record snapshot age
+			currentVersion := sm.GetCurrentVersion()
+			if currentVersion != "" {
+				if snapshot, err := sm.GetSnapshot(ctx, currentVersion); err == nil && snapshot != nil {
+					age := time.Since(snapshot.CreatedAt)
+					mc.RecordFloat(ctx, telemetry.MetricSnapshotAge, age.Seconds(), nil)
+				}
+			}
+
+			log.WithFields(logrus.Fields{
+				"hosts_total":   len(hosts),
+				"runners_total": totalRunners,
+				"runners_idle":  totalIdle,
+				"runners_busy":  totalBusy,
+			}).Debug("Metrics recorded")
+		}
+	}
 }

@@ -156,14 +156,39 @@ build {
     ]
   }
 
-  # Copy firecracker-manager binary (placeholder - would be built separately)
+  # Download firecracker-manager and thaw-agent binaries from GCS
+  # These should be uploaded to GCS before running packer:
+  #   gsutil cp bin/firecracker-manager gs://<project>-firecracker-snapshots/bin/
+  #   gsutil cp bin/thaw-agent gs://<project>-firecracker-snapshots/bin/
   provisioner "shell" {
     inline = [
-      "# In production, copy the built binary here",
-      "# For now, create a placeholder",
-      "echo '#!/bin/bash' | sudo tee /usr/local/bin/firecracker-manager",
-      "echo 'echo \"firecracker-manager placeholder\"' | sudo tee -a /usr/local/bin/firecracker-manager",
-      "sudo chmod +x /usr/local/bin/firecracker-manager"
+      "# Download binaries from GCS (uploaded during build pipeline)",
+      "# The project ID is derived from the metadata",
+      "PROJECT_ID=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/project/project-id || echo '')",
+      "if [ -n \"$PROJECT_ID\" ]; then",
+      "  gsutil cp gs://$${PROJECT_ID}-firecracker-snapshots/bin/firecracker-manager /tmp/firecracker-manager 2>/dev/null || true",
+      "  gsutil cp gs://$${PROJECT_ID}-firecracker-snapshots/bin/thaw-agent /tmp/thaw-agent 2>/dev/null || true",
+      "  if [ -f /tmp/firecracker-manager ]; then",
+      "    sudo mv /tmp/firecracker-manager /usr/local/bin/firecracker-manager",
+      "    sudo chmod +x /usr/local/bin/firecracker-manager",
+      "    echo 'firecracker-manager binary installed from GCS'",
+      "  else",
+      "    echo 'WARNING: firecracker-manager binary not found in GCS, using placeholder'",
+      "    echo '#!/bin/bash' | sudo tee /usr/local/bin/firecracker-manager",
+      "    echo 'echo \"firecracker-manager placeholder - upload binary to GCS\"' | sudo tee -a /usr/local/bin/firecracker-manager",
+      "    sudo chmod +x /usr/local/bin/firecracker-manager",
+      "  fi",
+      "  if [ -f /tmp/thaw-agent ]; then",
+      "    sudo mv /tmp/thaw-agent /usr/local/bin/thaw-agent",
+      "    sudo chmod +x /usr/local/bin/thaw-agent",
+      "    echo 'thaw-agent binary installed from GCS'",
+      "  fi",
+      "else",
+      "  echo 'Could not determine project ID, creating placeholder'",
+      "  echo '#!/bin/bash' | sudo tee /usr/local/bin/firecracker-manager",
+      "  echo 'echo \"firecracker-manager placeholder\"' | sudo tee -a /usr/local/bin/firecracker-manager",
+      "  sudo chmod +x /usr/local/bin/firecracker-manager",
+      "fi"
     ]
   }
 

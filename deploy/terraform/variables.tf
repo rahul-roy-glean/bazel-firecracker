@@ -125,9 +125,9 @@ variable "git_cache_repos" {
 }
 
 variable "git_cache_workspace_dir" {
-  description = "Target directory for cloned repos inside microVMs"
+  description = "Base directory for cloned repos inside microVMs. Final path: {this}/{repo}/{repo}"
   type        = string
-  default     = "/mnt/ephemeral/workdir"
+  default     = "/mnt/ephemeral/workspace"
 }
 
 variable "github_app_id" {
@@ -142,4 +142,89 @@ variable "github_app_secret" {
   default     = ""
 }
 
+variable "github_runner_labels" {
+  description = "Comma-separated labels for GitHub Actions runners (e.g., 'self-hosted,firecracker,Linux,X64,bazel')"
+  type        = string
+  default     = "self-hosted,firecracker,Linux,X64"
+}
 
+# MicroVM configuration per host
+variable "max_runners_per_host" {
+  description = "Maximum number of microVMs (runners) per host"
+  type        = number
+  default     = 16
+}
+
+variable "idle_runners_target" {
+  description = "Target number of idle runners to maintain per host"
+  type        = number
+  default     = 2
+}
+
+variable "vcpus_per_runner" {
+  description = "Number of vCPUs allocated to each microVM"
+  type        = number
+  default     = 4
+}
+
+variable "memory_per_runner_mb" {
+  description = "Memory in MB allocated to each microVM"
+  type        = number
+  default     = 8192
+}
+
+variable "runner_ephemeral" {
+  description = "Whether GitHub runners are ephemeral (one job per VM) or persistent (multiple jobs)"
+  type        = bool
+  default     = true
+}
+
+# Container Registry configuration
+variable "container_registry_location" {
+  description = "Location for Artifact Registry (e.g., us-central1, us, eu)"
+  type        = string
+  default     = "us-central1"
+}
+
+variable "container_registry_repo_name" {
+  description = "Name of the Artifact Registry repository"
+  type        = string
+  default     = "firecracker"
+}
+
+# Monitoring configuration
+variable "enable_monitoring" {
+  description = "Enable GCP Cloud Monitoring dashboards and log-based metrics"
+  type        = bool
+  default     = true
+}
+
+variable "enable_monitoring_alerts" {
+  description = "Enable GCP Cloud Monitoring alert policies (requires enable_monitoring=true)"
+  type        = bool
+  default     = false
+}
+
+variable "monitoring_notification_channels" {
+  description = "List of notification channel IDs for alerts (e.g., Slack, PagerDuty)"
+  type        = list(string)
+  default     = []
+}
+
+variable "alert_vm_boot_threshold_seconds" {
+  description = "Alert when VM boot p95 exceeds this threshold in seconds"
+  type        = number
+  default     = 10
+}
+
+variable "alert_queue_depth_threshold" {
+  description = "Alert when job queue depth exceeds this threshold"
+  type        = number
+  default     = 50
+}
+
+variable "alert_snapshot_age_threshold_hours" {
+  description = "Alert when active snapshot is older than this many hours"
+  type        = number
+  default     = 48
+}

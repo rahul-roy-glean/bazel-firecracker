@@ -62,7 +62,8 @@ spec:
       serviceAccountName: control-plane
       containers:
       - name: control-plane
-        image: gcr.io/${PROJECT_ID}/firecracker-control-plane:latest
+        # Using Artifact Registry. Format: REGION-docker.pkg.dev/PROJECT_ID/REPO_NAME/IMAGE
+        image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/firecracker/control-plane:latest
         ports:
         - name: grpc
           containerPort: 50051

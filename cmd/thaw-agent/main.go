@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 var (
@@ -47,6 +49,23 @@ var (
 	gitCacheLabel        = flag.String("git-cache-label", "GIT_CACHE", "Filesystem label for git-cache drive")
 )
 
+// WarmupState tracks the current warmup progress (for snapshot building)
+type WarmupState struct {
+	Phase            string    `json:"phase"`
+	Message          string    `json:"message,omitempty"`
+	Error            string    `json:"error,omitempty"`
+	Complete         bool      `json:"complete"`
+	StartedAt        time.Time `json:"started_at"`
+	CompletedAt      time.Time `json:"completed_at,omitempty"`
+	Duration         string    `json:"duration,omitempty"`
+	ExternalsFetched int       `json:"externals_fetched,omitempty"`
+}
+
+var globalWarmupState = &WarmupState{
+	Phase:     "initializing",
+	StartedAt: time.Now(),
+}
+
 // MMDSData represents the data structure from MMDS
 type MMDSData struct {
 	Latest struct {
@@ -54,6 +73,7 @@ type MMDSData struct {
 			RunnerID    string `json:"runner_id"`
 			HostID      string `json:"host_id"`
 			Environment string `json:"environment"`
+			Mode        string `json:"mode,omitempty"` // "warmup" for snapshot building, empty for normal runner
 		} `json:"meta"`
 		Buildbarn struct {
 			CertsMountPath string `json:"certs_mount_path,omitempty"`
@@ -82,10 +102,21 @@ type MMDSData struct {
 			RepoMappings map[string]string `json:"repo_mappings,omitempty"`
 			WorkspaceDir string            `json:"workspace_dir,omitempty"`
 		} `json:"git_cache,omitempty"`
+		Runner struct {
+			Ephemeral bool `json:"ephemeral"`
+		} `json:"runner,omitempty"`
+		Warmup struct {
+			RepoURL       string `json:"repo_url,omitempty"`
+			RepoBranch    string `json:"repo_branch,omitempty"`
+			BazelVersion  string `json:"bazel_version,omitempty"`
+			WarmupTargets string `json:"warmup_targets,omitempty"`
+		} `json:"warmup,omitempty"`
 	} `json:"latest"`
 }
 
 var log *logrus.Logger
+var metrics *telemetry.StructuredLogger
+var bootTimer *telemetry.Timer
 
 func main() {
 	flag.Parse()
@@ -98,6 +129,9 @@ func main() {
 		level = logrus.InfoLevel
 	}
 	log.SetLevel(level)
+
+	// Start boot timer immediately
+	bootTimer = telemetry.NewTimer()
 
 	log.Info("Thaw agent starting...")
 
@@ -127,12 +161,16 @@ func main() {
 		log.WithError(err).Fatal("Failed to get MMDS data")
 	}
 
+	bootTimer.Phase("mmds_wait")
 	log.WithFields(logrus.Fields{
 		"runner_id": mmdsData.Latest.Meta.RunnerID,
 		"host_id":   mmdsData.Latest.Meta.HostID,
 		"repo":      mmdsData.Latest.Job.Repo,
 		"branch":    mmdsData.Latest.Job.Branch,
 	}).Info("MMDS data received")
+
+	// Initialize structured metrics logger for GCP log-based metrics
+	metrics = telemetry.NewStructuredLogger(log, "thaw-agent", mmdsData.Latest.Meta.RunnerID)
 
 	// Setup shared repo cache overlay (seed is shared across VMs, upper is per-VM).
 	if !*skipRepoCache {
@@ -141,6 +179,7 @@ func main() {
 			log.WithError(err).Error("Failed to setup repo cache overlay")
 		}
 	}
+	bootTimer.Phase("repo_cache_overlay")
 
 	// Mount Buildbarn certificate drive (shared read-only seed image packaged by host).
 	if !*skipBuildbarnCerts {
@@ -149,6 +188,7 @@ func main() {
 			log.WithError(err).Error("Failed to mount Buildbarn certs")
 		}
 	}
+	bootTimer.Phase("buildbarn_certs")
 
 	// Mount git-cache for fast reference cloning
 	if !*skipGitCache && mmdsData.Latest.GitCache.Enabled {
@@ -157,6 +197,7 @@ func main() {
 			log.WithError(err).Error("Failed to mount git-cache")
 		}
 	}
+	bootTimer.Phase("git_cache_mount")
 
 	// Configure network
 	if !*skipNetwork {
@@ -165,18 +206,21 @@ func main() {
 			log.WithError(err).Error("Failed to configure network")
 		}
 	}
+	bootTimer.Phase("network_config")
 
 	// Regenerate hostname
 	log.Info("Regenerating hostname...")
 	if err := regenerateHostname(mmdsData.Latest.Meta.RunnerID); err != nil {
 		log.WithError(err).Warn("Failed to regenerate hostname")
 	}
+	bootTimer.Phase("hostname")
 
 	// Resync clock
 	log.Info("Resyncing clock...")
 	if err := resyncClock(); err != nil {
 		log.WithError(err).Warn("Failed to resync clock")
 	}
+	bootTimer.Phase("clock_sync")
 
 	// Mount tmpfs for workspace if needed (rootfs is often too small)
 	if mmdsData.Latest.GitCache.WorkspaceDir != "" {
@@ -195,11 +239,44 @@ func main() {
 	// Sync git repository
 	if !*skipGitSync && mmdsData.Latest.Job.Repo != "" {
 		log.Info("Syncing git repository...")
+		gitTimer := telemetry.NewStopwatch()
 		if err := syncGitRepo(mmdsData); err != nil {
 			log.WithError(err).Error("Failed to sync git repo")
 		}
+		bootTimer.Phase("git_sync")
+		if metrics != nil {
+			metrics.LogDuration(telemetry.MetricCacheGitCloneDuration, gitTimer.Elapsed(), nil)
+		}
 	}
 
+	// Check if we're in warmup mode (for snapshot building)
+	if mmdsData.Latest.Meta.Mode == "warmup" {
+		log.Info("Running in WARMUP mode for snapshot building")
+		
+		// Run warmup process (blocking until complete)
+		if err := runWarmupMode(mmdsData); err != nil {
+			globalWarmupState.Error = err.Error()
+			globalWarmupState.Phase = "failed"
+			log.WithError(err).Error("Warmup failed")
+		} else {
+			globalWarmupState.Complete = true
+			globalWarmupState.Phase = "complete"
+			globalWarmupState.CompletedAt = time.Now()
+			globalWarmupState.Duration = time.Since(globalWarmupState.StartedAt).String()
+			log.Info("Warmup completed successfully")
+		}
+		
+		// Signal ready
+		if err := signalReady(); err != nil {
+			log.WithError(err).Error("Failed to signal ready")
+		}
+		
+		// Start health server (snapshot-builder will poll warmup status then take snapshot)
+		startHealthServer(mmdsData)
+		return
+	}
+	
+	// Normal runner mode
 	// Register GitHub runner
 	if !*skipRunner && mmdsData.Latest.Job.GitHubRunnerToken != "" {
 		log.Info("Registering GitHub runner...")
@@ -207,14 +284,25 @@ func main() {
 			log.WithError(err).Error("Failed to register GitHub runner")
 		}
 	}
+	bootTimer.Phase("github_runner")
 
 	// Signal ready
 	log.Info("Signaling ready...")
 	if err := signalReady(); err != nil {
 		log.WithError(err).Error("Failed to signal ready")
 	}
+	bootTimer.Stop()
 
-	log.Info("Thaw agent initialization complete, starting health server...")
+	// Log boot completion metrics
+	if metrics != nil {
+		metrics.LogBootComplete(bootTimer)
+		metrics.LogDuration(telemetry.MetricVMReadyDuration, bootTimer.Total(), nil)
+	}
+
+	log.WithFields(logrus.Fields{
+		"total_ms": bootTimer.Total().Milliseconds(),
+		"phases":   bootTimer.PhaseMap(),
+	}).Info("Thaw agent initialization complete, starting health server...")
 
 	// Start health check HTTP server (blocking - runs indefinitely)
 	// This keeps the agent alive to serve health checks and for the manager to verify VM status
@@ -373,6 +461,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					RunnerID    string `json:"runner_id"`
 					HostID      string `json:"host_id"`
 					Environment string `json:"environment"`
+					Mode        string `json:"mode,omitempty"`
 				} `json:"meta"`
 				Buildbarn struct {
 					CertsMountPath string `json:"certs_mount_path,omitempty"`
@@ -401,6 +490,15 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					RepoMappings map[string]string `json:"repo_mappings,omitempty"`
 					WorkspaceDir string            `json:"workspace_dir,omitempty"`
 				} `json:"git_cache,omitempty"`
+				Runner struct {
+					Ephemeral bool `json:"ephemeral"`
+				} `json:"runner,omitempty"`
+				Warmup struct {
+					RepoURL       string `json:"repo_url,omitempty"`
+					RepoBranch    string `json:"repo_branch,omitempty"`
+					BazelVersion  string `json:"bazel_version,omitempty"`
+					WarmupTargets string `json:"warmup_targets,omitempty"`
+				} `json:"warmup,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
 				return nil, fmt.Errorf("failed to parse MMDS data: %w", err)
@@ -838,17 +936,25 @@ func registerGitHubRunner(data *MMDSData) error {
 	// Ensure runner directory is owned by runner user
 	exec.Command("chown", "-R", *runnerUsername+":"+*runnerUsername, runnerPath).Run()
 
-	// Configure runner as 'runner' user
-	configCmd := exec.Command(
-		filepath.Join(runnerPath, "config.sh"),
+	// Build config command arguments
+	configArgs := []string{
 		"--url", repoURL,
 		"--token", job.GitHubRunnerToken,
 		"--name", data.Latest.Meta.RunnerID[:8],
 		"--labels", labelsStr,
 		"--unattended",
 		"--replace",
-		"--ephemeral",
-	)
+	}
+	// Add --ephemeral flag if configured (defaults to true if not set)
+	if data.Latest.Runner.Ephemeral {
+		configArgs = append(configArgs, "--ephemeral")
+		log.Info("Runner configured as ephemeral (one job per VM)")
+	} else {
+		log.Info("Runner configured as persistent (multiple jobs)")
+	}
+
+	// Configure runner as 'runner' user
+	configCmd := exec.Command(filepath.Join(runnerPath, "config.sh"), configArgs...)
 	configCmd.Dir = runnerPath
 	configCmd.Stdout = os.Stdout
 	configCmd.Stderr = os.Stderr
@@ -895,6 +1001,118 @@ func signalReady() error {
 	return os.WriteFile(*readyFile, []byte(time.Now().Format(time.RFC3339)), 0644)
 }
 
+// runWarmupMode runs the Bazel warmup process for snapshot building
+func runWarmupMode(data *MMDSData) error {
+	warmup := data.Latest.Warmup
+	if warmup.RepoURL == "" {
+		return fmt.Errorf("no repo_url in warmup config")
+	}
+	
+	workDir := "/workspace"
+	repoDir := filepath.Join(workDir, "repo")
+	
+	// Phase 1: Clone repository
+	updateWarmupState("cloning", "Cloning repository...")
+	log.WithFields(logrus.Fields{
+		"repo_url": warmup.RepoURL,
+		"branch":   warmup.RepoBranch,
+	}).Info("Cloning repository for warmup")
+	
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return fmt.Errorf("failed to create workspace: %w", err)
+	}
+	
+	branch := warmup.RepoBranch
+	if branch == "" {
+		branch = "main"
+	}
+	
+	cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, warmup.RepoURL, repoDir)
+	cloneCmd.Stdout = os.Stdout
+	cloneCmd.Stderr = os.Stderr
+	cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if err := cloneCmd.Run(); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
+	}
+	
+	// Phase 2: Configure Bazel
+	updateWarmupState("configuring", "Configuring Bazel...")
+	
+	// Create bazelrc for warmup
+	bazelrcContent := `# Warmup-specific Bazel configuration
+build --repository_cache=/mnt/ephemeral/caches/repository
+build --disk_cache=/mnt/bazel-repo-upper/disk-cache
+build --experimental_repository_cache_hardlinks
+build --jobs=auto
+build --local_ram_resources=HOST_RAM*.8
+build --local_cpu_resources=HOST_CPUS
+`
+	bazelrcPath := filepath.Join(repoDir, ".bazelrc.warmup")
+	if err := os.WriteFile(bazelrcPath, []byte(bazelrcContent), 0644); err != nil {
+		log.WithError(err).Warn("Failed to write bazelrc.warmup")
+	}
+	
+	// Phase 3: Fetch external dependencies
+	updateWarmupState("fetching", "Fetching external dependencies...")
+	log.Info("Running bazel fetch //...")
+	
+	fetchCmd := exec.Command("bazel", "--bazelrc="+bazelrcPath, "fetch", "//...")
+	fetchCmd.Dir = repoDir
+	fetchCmd.Stdout = os.Stdout
+	fetchCmd.Stderr = os.Stderr
+	fetchCmd.Env = append(os.Environ(), "HOME=/home/runner")
+	if err := fetchCmd.Run(); err != nil {
+		log.WithError(err).Warn("bazel fetch failed (continuing)")
+	}
+	
+	// Count fetched externals
+	externalsDir := filepath.Join("/mnt/ephemeral/caches/repository", "content_addressable")
+	if entries, err := os.ReadDir(externalsDir); err == nil {
+		globalWarmupState.ExternalsFetched = len(entries)
+	}
+	
+	// Phase 4: Run analysis
+	updateWarmupState("analyzing", "Running Bazel analysis (--nobuild)...")
+	log.Info("Running bazel build --nobuild //...")
+	
+	analyzeCmd := exec.Command("bazel", "--bazelrc="+bazelrcPath, "build", "--nobuild", "//...")
+	analyzeCmd.Dir = repoDir
+	analyzeCmd.Stdout = os.Stdout
+	analyzeCmd.Stderr = os.Stderr
+	analyzeCmd.Env = append(os.Environ(), "HOME=/home/runner")
+	if err := analyzeCmd.Run(); err != nil {
+		log.WithError(err).Warn("bazel build --nobuild failed (continuing)")
+	}
+	
+	// Phase 5: Start Bazel server (keeps server state in memory for snapshot)
+	updateWarmupState("starting_server", "Starting Bazel server...")
+	log.Info("Starting persistent Bazel server")
+	
+	infoCmd := exec.Command("bazel", "--bazelrc="+bazelrcPath, "info")
+	infoCmd.Dir = repoDir
+	infoCmd.Stdout = os.Stdout
+	infoCmd.Stderr = os.Stderr
+	infoCmd.Env = append(os.Environ(), "HOME=/home/runner")
+	if err := infoCmd.Run(); err != nil {
+		log.WithError(err).Warn("bazel info failed")
+	}
+	
+	// Phase 6: Sync caches to disk
+	updateWarmupState("syncing", "Syncing caches to disk...")
+	exec.Command("sync").Run()
+	
+	return nil
+}
+
+func updateWarmupState(phase, message string) {
+	globalWarmupState.Phase = phase
+	globalWarmupState.Message = message
+	log.WithFields(logrus.Fields{
+		"phase":   phase,
+		"message": message,
+	}).Info("Warmup progress")
+}
+
 // startHealthServer starts a simple HTTP server for health checks and testing
 func startHealthServer(mmdsData *MMDSData) {
 	mux := http.NewServeMux()
@@ -905,8 +1123,15 @@ func startHealthServer(mmdsData *MMDSData) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":    "healthy",
 			"runner_id": mmdsData.Latest.Meta.RunnerID,
-			"uptime":    time.Since(time.Now()).String(),
+			"mode":      mmdsData.Latest.Meta.Mode,
+			"uptime":    time.Since(globalWarmupState.StartedAt).String(),
 		})
+	})
+	
+	// Warmup status endpoint (for snapshot-builder to poll)
+	mux.HandleFunc("/warmup-status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(globalWarmupState)
 	})
 
 	// Network info endpoint

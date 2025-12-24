@@ -79,6 +79,9 @@ resource "google_container_cluster" "control_plane" {
 
   resource_labels = local.labels
 
+  # Allow cluster deletion (set to true in production)
+  deletion_protection = false
+
   depends_on = [
     google_compute_subnetwork.gke,
     google_project_service.apis,

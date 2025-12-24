@@ -349,6 +349,9 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		data.Latest.GitCache.WorkspaceDir = m.config.GitCacheWorkspaceDir
 	}
 
+	// Runner configuration
+	data.Latest.Runner.Ephemeral = m.config.GitHubRunnerEphemeral
+
 	return data
 }
 
@@ -907,6 +910,76 @@ func (m *Manager) DrainIdleRunners(ctx context.Context) (int, error) {
 		return stopped, joinErrors(errs)
 	}
 	return stopped, nil
+}
+
+// RemoveRunnerLabels removes custom labels from all runners on this host.
+// This is called when entering drain mode to prevent GitHub from scheduling new jobs.
+func (m *Manager) RemoveRunnerLabels(ctx context.Context) (int, error) {
+	if m.githubClient == nil {
+		m.logger.Debug("GitHub client not configured, skipping label removal")
+		return 0, nil
+	}
+
+	repo := m.config.GitHubRepo
+	if repo == "" {
+		m.logger.Debug("GitHub repo not configured, skipping label removal")
+		return 0, nil
+	}
+
+	m.mu.RLock()
+	runners := make([]*Runner, 0, len(m.runners))
+	for _, r := range m.runners {
+		runners = append(runners, r)
+	}
+	m.mu.RUnlock()
+
+	if len(runners) == 0 {
+		return 0, nil
+	}
+
+	m.logger.WithFields(logrus.Fields{
+		"runner_count": len(runners),
+		"repo":         repo,
+	}).Info("Removing labels from runners for drain mode")
+
+	var errs []error
+	removed := 0
+
+	for _, runner := range runners {
+		// Get runner name (first 8 chars of ID, matching thaw-agent registration)
+		runnerName := runner.ID
+		if len(runnerName) > 8 {
+			runnerName = runnerName[:8]
+		}
+
+		// Look up GitHub runner by name
+		ghRunner, err := m.githubClient.GetRunnerByName(ctx, repo, runnerName)
+		if err != nil {
+			m.logger.WithError(err).WithField("runner_name", runnerName).Debug("Runner not found in GitHub (may not be registered yet)")
+			continue
+		}
+
+		// Remove all custom labels
+		if err := m.githubClient.RemoveAllCustomLabels(ctx, repo, ghRunner.ID); err != nil {
+			m.logger.WithError(err).WithFields(logrus.Fields{
+				"runner_name":   runnerName,
+				"github_runner": ghRunner.ID,
+			}).Warn("Failed to remove labels from runner")
+			errs = append(errs, err)
+			continue
+		}
+
+		m.logger.WithFields(logrus.Fields{
+			"runner_name":   runnerName,
+			"github_runner": ghRunner.ID,
+		}).Info("Removed labels from runner")
+		removed++
+	}
+
+	if len(errs) > 0 {
+		return removed, joinErrors(errs)
+	}
+	return removed, nil
 }
 
 // Close shuts down the manager and all runners

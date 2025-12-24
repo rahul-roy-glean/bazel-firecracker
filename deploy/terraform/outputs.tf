@@ -74,4 +74,14 @@ output "microvm_subnet" {
   description = "Subnet CIDR for microVM NAT networking"
 }
 
+output "container_registry" {
+  value       = "${google_artifact_registry_repository.containers.location}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.containers.repository_id}"
+  description = "Artifact Registry URL for container images"
+}
+
+output "control_plane_image" {
+  value       = "${google_artifact_registry_repository.containers.location}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.containers.repository_id}/control-plane"
+  description = "Full image path for control-plane container"
+}
+
 

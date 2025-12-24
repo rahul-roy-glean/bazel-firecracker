@@ -76,6 +76,12 @@ resource "google_compute_instance_template" "firecracker_host" {
     git-cache-workspace   = var.git_cache_workspace_dir
     github-app-id         = var.github_app_id
     github-app-secret     = var.github_app_secret
+    github-runner-labels  = var.github_runner_labels
+    max-runners           = var.max_runners_per_host
+    idle-target           = var.idle_runners_target
+    vcpus-per-runner      = var.vcpus_per_runner
+    memory-per-runner     = var.memory_per_runner_mb
+    runner-ephemeral      = var.runner_ephemeral ? "true" : "false"
   }
 
   metadata_startup_script = <<-EOF
@@ -247,8 +253,42 @@ resource "google_compute_instance_template" "firecracker_host" {
     # Set permissions for KVM
     chmod 666 /dev/kvm || true
 
-    # Start firecracker-manager service
-    echo "Starting firecracker-manager..."
+    # Get microVM configuration from metadata
+    MAX_RUNNERS=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/max-runners || echo "16")
+    IDLE_TARGET=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/idle-target || echo "2")
+    VCPUS_PER_RUNNER=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/vcpus-per-runner || echo "4")
+    MEMORY_PER_RUNNER=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/memory-per-runner || echo "8192")
+    RUNNER_LABELS=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-runner-labels || echo "self-hosted,firecracker,Linux,X64")
+    RUNNER_EPHEMERAL=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/runner-ephemeral || echo "true")
+    CONTROL_PLANE=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/control-plane || echo "")
+
+    # Create systemd override for firecracker-manager with configured values
+    mkdir -p /etc/systemd/system/firecracker-manager.service.d
+    cat > /etc/systemd/system/firecracker-manager.service.d/override.conf << OVERRIDE
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/firecracker-manager \\
+  --max-runners=$MAX_RUNNERS \\
+  --idle-target=$IDLE_TARGET \\
+  --vcpus-per-runner=$VCPUS_PER_RUNNER \\
+  --memory-mb=$MEMORY_PER_RUNNER \\
+  --github-runner-labels=$RUNNER_LABELS \\
+  --runner-ephemeral=$RUNNER_EPHEMERAL \\
+  --snapshot-dir=/mnt/nvme/snapshots \\
+  --workspace-dir=/mnt/nvme/workspaces \\
+  --control-plane-addr=$CONTROL_PLANE
+OVERRIDE
+
+    # Reload and start firecracker-manager service
+    echo "Starting firecracker-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, vcpus=$VCPUS_PER_RUNNER, memory=$MEMORY_PER_RUNNER"
+    systemctl daemon-reload
     systemctl enable firecracker-manager
     systemctl start firecracker-manager
 

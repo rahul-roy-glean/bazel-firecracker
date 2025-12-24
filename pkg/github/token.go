@@ -164,3 +164,167 @@ func (c *TokenClient) GetRunnerRegistrationToken(ctx context.Context, repo strin
 	return tokenResp.Token, nil
 }
 
+// Runner represents a GitHub Actions runner
+type Runner struct {
+	ID     int64    `json:"id"`
+	Name   string   `json:"name"`
+	OS     string   `json:"os"`
+	Status string   `json:"status"`
+	Busy   bool     `json:"busy"`
+	Labels []Label  `json:"labels"`
+}
+
+// Label represents a runner label
+type Label struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// ListRunners lists all runners for a repository
+func (c *TokenClient) ListRunners(ctx context.Context, repo string) ([]Runner, error) {
+	installToken, err := c.GetInstallationToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get installation token: %w", err)
+	}
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/actions/runners", repo)
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("Authorization", "token "+installToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list runners: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to list runners: %s - %s", resp.Status, string(body))
+	}
+
+	var listResp struct {
+		TotalCount int      `json:"total_count"`
+		Runners    []Runner `json:"runners"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+		return nil, fmt.Errorf("failed to decode runners: %w", err)
+	}
+
+	return listResp.Runners, nil
+}
+
+// GetRunnerByName finds a runner by name
+func (c *TokenClient) GetRunnerByName(ctx context.Context, repo, name string) (*Runner, error) {
+	runners, err := c.ListRunners(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, r := range runners {
+		if r.Name == name {
+			return &r, nil
+		}
+	}
+
+	return nil, fmt.Errorf("runner not found: %s", name)
+}
+
+// RemoveRunnerLabel removes a custom label from a runner
+func (c *TokenClient) RemoveRunnerLabel(ctx context.Context, repo string, runnerID int64, labelName string) error {
+	installToken, err := c.GetInstallationToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get installation token: %w", err)
+	}
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/actions/runners/%d/labels/%s", repo, runnerID, labelName)
+	req, _ := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	req.Header.Set("Authorization", "token "+installToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to remove label: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 200 OK = success, 404 = label doesn't exist (also fine)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to remove label: %s - %s", resp.Status, string(body))
+	}
+
+	return nil
+}
+
+// RemoveAllCustomLabels removes all custom labels from a runner (keeps default labels like self-hosted, Linux, X64)
+func (c *TokenClient) RemoveAllCustomLabels(ctx context.Context, repo string, runnerID int64) error {
+	installToken, err := c.GetInstallationToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get installation token: %w", err)
+	}
+
+	// First get current labels
+	url := fmt.Sprintf("https://api.github.com/repos/%s/actions/runners/%d/labels", repo, runnerID)
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("Authorization", "token "+installToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get runner labels: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to get runner labels: %s - %s", resp.Status, string(body))
+	}
+
+	var labelsResp struct {
+		Labels []Label `json:"labels"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&labelsResp); err != nil {
+		return fmt.Errorf("failed to decode labels: %w", err)
+	}
+
+	// Remove only custom labels (type == "custom")
+	// Default labels have type "read-only" and cannot be removed
+	for _, label := range labelsResp.Labels {
+		if label.Type == "custom" {
+			if err := c.RemoveRunnerLabel(ctx, repo, runnerID, label.Name); err != nil {
+				return fmt.Errorf("failed to remove label %s: %w", label.Name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// DeleteRunner removes a runner from GitHub (deregisters it)
+func (c *TokenClient) DeleteRunner(ctx context.Context, repo string, runnerID int64) error {
+	installToken, err := c.GetInstallationToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get installation token: %w", err)
+	}
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/actions/runners/%d", repo, runnerID)
+	req, _ := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	req.Header.Set("Authorization", "token "+installToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to delete runner: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to delete runner: %s - %s", resp.Status, string(body))
+	}
+
+	return nil
+}
+

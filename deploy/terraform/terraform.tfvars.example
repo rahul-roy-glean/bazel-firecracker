@@ -26,4 +26,8 @@ gke_pods_cidr     = "10.1.0.0/16"
 gke_services_cidr = "10.2.0.0/16"
 microvm_subnet    = "172.16.0.0/24"
 
+# Container Registry (Artifact Registry)
+container_registry_location  = "us-central1"
+container_registry_repo_name = "firecracker"
+
 

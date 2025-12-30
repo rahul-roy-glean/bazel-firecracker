@@ -1,6 +1,21 @@
 # MicroVM Rootfs - Glean CI Environment
 # Based on the same tooling as ci-runner-ubuntu-2204.pkr.hcl
 
+# ============================================================================
+# Build stage for thaw-agent (must be first so other stages can copy from it)
+# ============================================================================
+FROM golang:1.24 AS thaw-agent-builder
+
+WORKDIR /build
+COPY cmd/thaw-agent/ ./cmd/thaw-agent/
+COPY pkg/ ./pkg/
+COPY go.mod go.sum ./
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
+
+# ============================================================================
+# Base stage with all tools
+# ============================================================================
 FROM ubuntu:22.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -130,12 +145,11 @@ RUN systemctl set-default multi-user.target \
         systemd-networkd-wait-online.service \
         systemd-timesyncd.service
 
-# Configure network
-COPY rootfs/etc/systemd/network/10-eth0.network /etc/systemd/network/
-RUN systemctl enable systemd-networkd
+# Configure network (static config applied by thaw-agent at boot)
+COPY images/microvm/rootfs/etc/systemd/network/10-eth0.network /etc/systemd/network/
 
 # Copy thaw-agent systemd service
-COPY rootfs/etc/systemd/system/thaw-agent.service /etc/systemd/system/
+COPY images/microvm/rootfs/etc/systemd/system/thaw-agent.service /etc/systemd/system/
 RUN systemctl enable thaw-agent.service
 
 # Copy thaw-agent binary (built in multi-stage)
@@ -156,18 +170,6 @@ RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /workspace
 USER gleanuser
-
-# ============================================================================
-# Build stage for thaw-agent
-# ============================================================================
-FROM golang:1.22 AS thaw-agent-builder
-
-WORKDIR /build
-COPY cmd/thaw-agent/ ./cmd/thaw-agent/
-COPY pkg/ ./pkg/
-COPY go.mod go.sum ./
-
-RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
 
 # ============================================================================
 # Final rootfs stage

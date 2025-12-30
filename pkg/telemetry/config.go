@@ -103,7 +103,7 @@ func ConfigFromEnv() Config {
 	return cfg
 }
 
-// Validate checks if the configuration is valid.
+// Validate checks if the configuration is valid and applies defaults.
 func (c *Config) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -113,6 +113,13 @@ func (c *Config) Validate() error {
 	}
 	if c.Component == "" {
 		return &ConfigError{Field: "Component", Message: "required when telemetry is enabled"}
+	}
+	// Apply defaults for FlushInterval and BufferSize if not set
+	if c.FlushInterval <= 0 {
+		c.FlushInterval = 10 * time.Second
+	}
+	if c.BufferSize <= 0 {
+		c.BufferSize = 100
 	}
 	return nil
 }

@@ -582,6 +582,7 @@ resource "google_monitoring_alert_policy" "host_unhealthy" {
 }
 
 # Log-based metric for thaw-agent boot phases (runs inside VM)
+# Using DISTRIBUTION type to extract numeric values
 resource "google_logging_metric" "vm_boot_phase_from_logs" {
   count       = var.enable_monitoring ? 1 : 0
   name        = "firecracker/vm_boot_phase_from_logs"
@@ -592,8 +593,8 @@ resource "google_logging_metric" "vm_boot_phase_from_logs" {
   EOT
 
   metric_descriptor {
-    metric_kind = "GAUGE"
-    value_type  = "DOUBLE"
+    metric_kind = "DELTA"
+    value_type  = "DISTRIBUTION"
     unit        = "ms"
     labels {
       key         = "phase"
@@ -613,9 +614,18 @@ resource "google_logging_metric" "vm_boot_phase_from_logs" {
     "phase"     = "EXTRACT(jsonPayload.phase)"
     "runner_id" = "EXTRACT(jsonPayload.runner_id)"
   }
+
+  bucket_options {
+    exponential_buckets {
+      num_finite_buckets = 64
+      growth_factor      = 1.4
+      scale              = 10
+    }
+  }
 }
 
 # Log-based metric for job completions
+# Using DISTRIBUTION type to extract numeric values
 resource "google_logging_metric" "job_complete_from_logs" {
   count       = var.enable_monitoring ? 1 : 0
   name        = "firecracker/job_complete_from_logs"
@@ -626,8 +636,8 @@ resource "google_logging_metric" "job_complete_from_logs" {
   EOT
 
   metric_descriptor {
-    metric_kind = "GAUGE"
-    value_type  = "DOUBLE"
+    metric_kind = "DELTA"
+    value_type  = "DISTRIBUTION"
     unit        = "ms"
     labels {
       key         = "repo"
@@ -646,6 +656,14 @@ resource "google_logging_metric" "job_complete_from_logs" {
   label_extractors = {
     "repo"   = "EXTRACT(jsonPayload.repo)"
     "result" = "EXTRACT(jsonPayload.result)"
+  }
+
+  bucket_options {
+    exponential_buckets {
+      num_finite_buckets = 64
+      growth_factor      = 1.4
+      scale              = 1000  # Scale for milliseconds (job durations can be long)
+    }
   }
 }
 

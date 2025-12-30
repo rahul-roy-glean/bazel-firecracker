@@ -40,20 +40,17 @@ resource "google_compute_instance_template" "firecracker_host" {
     auto_delete  = true
   }
 
-  # Local NVMe SSDs for fast snapshot restore (~3GB/s read)
-  # n2-standard-16 requires SSDs in multiples of 2 (each 375GB)
+  # Additional data disk for snapshots and workspaces
+  # Using pd-ssd instead of local SSDs to avoid n2-standard-64's
+  # requirement for 8/16/24 SSDs (3TB+ minimum)
+  # pd-ssd provides ~100K IOPS which is sufficient for this workload
   disk {
-    type         = "SCRATCH"
-    disk_type    = "local-ssd"
-    disk_size_gb = 375
-    interface    = "NVME"
-  }
-
-  disk {
-    type         = "SCRATCH"
-    disk_type    = "local-ssd"
-    disk_size_gb = 375
-    interface    = "NVME"
+    device_name  = "data"
+    type         = "PERSISTENT"
+    disk_type    = "pd-ssd"
+    disk_size_gb = var.host_data_disk_size_gb
+    boot         = false
+    auto_delete  = true
   }
 
   network_interface {
@@ -77,6 +74,8 @@ resource "google_compute_instance_template" "firecracker_host" {
     github-app-id         = var.github_app_id
     github-app-secret     = var.github_app_secret
     github-runner-labels  = var.github_runner_labels
+    github-repo           = var.github_repo
+    github-runner-enabled = var.github_runner_enabled ? "true" : "false"
     max-runners           = var.max_runners_per_host
     idle-target           = var.idle_runners_target
     vcpus-per-runner      = var.vcpus_per_runner
@@ -91,18 +90,33 @@ resource "google_compute_instance_template" "firecracker_host" {
     # Log startup
     echo "Starting Firecracker host initialization..."
 
-    # Mount local NVMe SSD
-    NVME_DEVICE="/dev/nvme0n1"
-    if [ -b "$NVME_DEVICE" ]; then
-      mkfs.ext4 -F "$NVME_DEVICE"
-      mkdir -p /mnt/nvme
-      mount "$NVME_DEVICE" /mnt/nvme
-      echo "$NVME_DEVICE /mnt/nvme ext4 defaults,nofail 0 2" >> /etc/fstab
+    # Mount the data disk (pd-ssd attached as /dev/sdb or by device name)
+    # Wait for disk to be attached
+    sleep 5
+    DATA_DISK="/dev/disk/by-id/google-data"
+    if [ -b "$DATA_DISK" ]; then
+      echo "Formatting and mounting data disk..."
+      mkfs.ext4 -F "$DATA_DISK"
+      mkdir -p /mnt/data
+      mount "$DATA_DISK" /mnt/data
+      echo "$DATA_DISK /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+    else
+      echo "Data disk not found at $DATA_DISK, checking alternatives..."
+      # Fallback to /dev/sdb
+      if [ -b "/dev/sdb" ]; then
+        mkfs.ext4 -F /dev/sdb
+        mkdir -p /mnt/data
+        mount /dev/sdb /mnt/data
+        echo "/dev/sdb /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+      else
+        echo "WARNING: No data disk found, using boot disk directory"
+        mkdir -p /mnt/data
+      fi
     fi
 
     # Create directories
-    mkdir -p /mnt/nvme/snapshots
-    mkdir -p /mnt/nvme/workspaces
+    mkdir -p /mnt/data/snapshots
+    mkdir -p /mnt/data/workspaces
     mkdir -p /var/run/firecracker
 
     # Get metadata
@@ -113,13 +127,13 @@ resource "google_compute_instance_template" "firecracker_host" {
 
     # Sync snapshots from GCS to local NVMe
     echo "Syncing snapshots from GCS..."
-    gsutil -m rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/nvme/snapshots/ || true
+    gsutil -m rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/data/snapshots/ || true
 
     # Download Bazel cache image from GCS (single file, much faster than rsync)
     echo "Downloading Bazel cache image from GCS..."
     if gsutil -q stat "gs://$SNAPSHOT_BUCKET/cache/bazel-cache.img" 2>/dev/null; then
-      gsutil cp "gs://$SNAPSHOT_BUCKET/cache/bazel-cache.img" /mnt/nvme/cache.img
-      echo "Bazel cache image downloaded: $(ls -lh /mnt/nvme/cache.img)"
+      gsutil cp "gs://$SNAPSHOT_BUCKET/cache/bazel-cache.img" /mnt/data/cache.img
+      echo "Bazel cache image downloaded: $(ls -lh /mnt/data/cache.img)"
     else
       echo "No bazel-cache.img found in GCS, skipping cache setup"
     fi
@@ -131,7 +145,7 @@ resource "google_compute_instance_template" "firecracker_host" {
 
     if [ "$GIT_CACHE_ENABLED" = "true" ]; then
       echo "Setting up git-cache..."
-      mkdir -p /mnt/nvme/git-cache
+      mkdir -p /mnt/data/git-cache
 
       # Get repo config from metadata
       GIT_CACHE_REPOS=$(curl -sf -H "Metadata-Flavor: Google" \
@@ -189,7 +203,7 @@ resource "google_compute_instance_template" "firecracker_host" {
         for mapping in "$${REPOS[@]}"; do
           REPO_URL=$(echo "$mapping" | cut -d: -f1)
           REPO_DIR=$(echo "$mapping" | cut -d: -f2)
-          CLONE_PATH="/mnt/nvme/git-cache/$REPO_DIR"
+          CLONE_PATH="/mnt/data/git-cache/$REPO_DIR"
 
           # Build authenticated URL
           if [ -n "$GIT_AUTH_URL" ]; then
@@ -210,14 +224,14 @@ resource "google_compute_instance_template" "firecracker_host" {
       fi
 
       # Create git-cache block device for Firecracker
-      if [ -d /mnt/nvme/git-cache ] && [ "$(ls -A /mnt/nvme/git-cache)" ]; then
+      if [ -d /mnt/data/git-cache ] && [ "$(ls -A /mnt/data/git-cache)" ]; then
         echo "Creating git-cache block device..."
-        rm -f /mnt/nvme/git-cache.img
-        truncate -s 80G /mnt/nvme/git-cache.img
-        mkfs.ext4 -F -L GIT_CACHE /mnt/nvme/git-cache.img
+        rm -f /mnt/data/git-cache.img
+        truncate -s 80G /mnt/data/git-cache.img
+        mkfs.ext4 -F -L GIT_CACHE /mnt/data/git-cache.img
         MOUNT_TMP=$(mktemp -d)
-        mount -o loop /mnt/nvme/git-cache.img "$MOUNT_TMP"
-        cp -a /mnt/nvme/git-cache/* "$MOUNT_TMP"/ || true
+        mount -o loop /mnt/data/git-cache.img "$MOUNT_TMP"
+        cp -a /mnt/data/git-cache/* "$MOUNT_TMP"/ || true
         chown -R root:root "$MOUNT_TMP"
         chmod -R 755 "$MOUNT_TMP"
         sync
@@ -266,31 +280,64 @@ resource "google_compute_instance_template" "firecracker_host" {
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-runner-labels || echo "self-hosted,firecracker,Linux,X64")
     RUNNER_EPHEMERAL=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/runner-ephemeral || echo "true")
+    GITHUB_REPO=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-repo || echo "")
+    GITHUB_RUNNER_ENABLED=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-runner-enabled || echo "false")
+    GIT_CACHE_ENABLED=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-enabled || echo "false")
+    GIT_CACHE_WORKSPACE=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-workspace || echo "/mnt/ephemeral/workspace")
     CONTROL_PLANE=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/control-plane || echo "")
 
+    # Stop firecracker-manager if already running (from Packer image auto-start)
+    # This ensures the override is applied before the service runs
+    systemctl stop firecracker-manager 2>/dev/null || true
+
     # Create systemd override for firecracker-manager with configured values
     mkdir -p /etc/systemd/system/firecracker-manager.service.d
+    
+    # Build the ExecStart line with optional flags
+    EXEC_START="/usr/local/bin/firecracker-manager"
+    EXEC_START="$EXEC_START --max-runners=$MAX_RUNNERS"
+    EXEC_START="$EXEC_START --idle-target=$IDLE_TARGET"
+    EXEC_START="$EXEC_START --vcpus-per-runner=$VCPUS_PER_RUNNER"
+    EXEC_START="$EXEC_START --memory-per-runner=$MEMORY_PER_RUNNER"
+    EXEC_START="$EXEC_START --github-runner-labels=$RUNNER_LABELS"
+    EXEC_START="$EXEC_START --runner-ephemeral=$RUNNER_EPHEMERAL"
+    EXEC_START="$EXEC_START --snapshot-cache=/mnt/data/snapshots"
+    EXEC_START="$EXEC_START --workspace-dir=/mnt/data/workspaces"
+    EXEC_START="$EXEC_START --git-cache-image=/mnt/data/git-cache.img"
+    
+    # Add git-cache flags if enabled
+    if [ "$GIT_CACHE_ENABLED" = "true" ]; then
+      EXEC_START="$EXEC_START --git-cache-enabled=true"
+      EXEC_START="$EXEC_START --git-cache-workspace=$GIT_CACHE_WORKSPACE"
+    fi
+    
+    # Add GitHub runner flags if enabled
+    if [ "$GITHUB_RUNNER_ENABLED" = "true" ] && [ -n "$GITHUB_REPO" ]; then
+      EXEC_START="$EXEC_START --github-runner-enabled=true"
+      EXEC_START="$EXEC_START --github-repo=$GITHUB_REPO"
+    fi
+    
+    # Add control plane if configured
+    if [ -n "$CONTROL_PLANE" ]; then
+      EXEC_START="$EXEC_START --control-plane=$CONTROL_PLANE"
+    fi
+    
     cat > /etc/systemd/system/firecracker-manager.service.d/override.conf << OVERRIDE
 [Service]
 ExecStart=
-ExecStart=/usr/local/bin/firecracker-manager \\
-  --max-runners=$MAX_RUNNERS \\
-  --idle-target=$IDLE_TARGET \\
-  --vcpus-per-runner=$VCPUS_PER_RUNNER \\
-  --memory-mb=$MEMORY_PER_RUNNER \\
-  --github-runner-labels=$RUNNER_LABELS \\
-  --runner-ephemeral=$RUNNER_EPHEMERAL \\
-  --snapshot-dir=/mnt/nvme/snapshots \\
-  --workspace-dir=/mnt/nvme/workspaces \\
-  --control-plane-addr=$CONTROL_PLANE
+ExecStart=$EXEC_START
 OVERRIDE
 
-    # Reload and start firecracker-manager service
+    # Reload and restart firecracker-manager service with new config
     echo "Starting firecracker-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, vcpus=$VCPUS_PER_RUNNER, memory=$MEMORY_PER_RUNNER"
     systemctl daemon-reload
     systemctl enable firecracker-manager
-    systemctl start firecracker-manager
+    systemctl restart firecracker-manager
 
     echo "Firecracker host initialization complete."
   EOF

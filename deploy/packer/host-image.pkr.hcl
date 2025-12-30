@@ -20,7 +20,7 @@ variable "zone" {
 
 variable "firecracker_version" {
   type        = string
-  default     = "1.6.0"
+  default     = "1.10.1"
   description = "Firecracker version to install"
 }
 
@@ -30,25 +30,41 @@ variable "image_family" {
   description = "Image family name"
 }
 
+variable "network" {
+  type        = string
+  default     = "default"
+  description = "VPC network to use for building"
+}
+
+variable "subnetwork" {
+  type        = string
+  default     = "default"
+  description = "Subnetwork to use for building"
+}
+
 source "googlecompute" "firecracker-host" {
-  project_id          = var.project_id
-  zone                = var.zone
-  source_image_family = "debian-12"
-  source_image_project_id = ["debian-cloud"]
-  
-  machine_type        = "n2-standard-4"
-  disk_size           = 50
-  disk_type           = "pd-ssd"
-  
-  image_name          = "firecracker-host-{{timestamp}}"
-  image_family        = var.image_family
-  image_description   = "Firecracker host image with KVM support"
-  
-  ssh_username        = "packer"
-  
-  # Enable nested virtualization for building
+  project_id              = var.project_id
+  zone                    = var.zone
+  source_image_family     = "ubuntu-2204-lts"
+  source_image_project_id = ["ubuntu-os-cloud"]
+
+  machine_type = "n2-standard-4"
+  disk_size    = 50
+  disk_type    = "pd-ssd"
+
+  image_name        = "firecracker-host-{{timestamp}}"
+  image_family      = var.image_family
+  image_description = "Firecracker host image with KVM support"
+
+  ssh_username = "ubuntu"
+  use_iap      = true
+
+  network    = var.network
+  subnetwork = var.subnetwork
+
+  # Enable nested virtualization for Firecracker
   enable_nested_virtualization = true
-  
+
   metadata = {
     enable-oslogin = "FALSE"
   }
@@ -57,41 +73,55 @@ source "googlecompute" "firecracker-host" {
 build {
   sources = ["source.googlecompute.firecracker-host"]
 
-  # Update system
+  # Update system and install base packages
+  provisioner "shell" {
+    environment_vars = [
+      "DEBIAN_FRONTEND=noninteractive"
+    ]
+    inline = [
+      "set -o errexit -o nounset -o xtrace",
+      "sudo apt-get update",
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y",
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget gnupg2 software-properties-common apt-transport-https ca-certificates jq git"
+    ]
+  }
+
+  # Install Cloud Ops Agent for monitoring and logging
   provisioner "shell" {
     inline = [
-      "sudo apt-get update",
-      "sudo apt-get upgrade -y",
-      "sudo apt-get install -y curl wget gnupg2 software-properties-common apt-transport-https ca-certificates"
+      "curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh",
+      "sudo bash add-google-cloud-ops-agent-repo.sh --also-install",
+      "sudo systemctl enable google-cloud-ops-agent"
     ]
   }
 
   # Install KVM and virtualization tools
   provisioner "shell" {
     inline = [
-      "sudo apt-get install -y qemu-kvm libvirt-daemon-system virtinst bridge-utils",
-      "sudo apt-get install -y linux-headers-$(uname -r)",
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-kvm libvirt-daemon-system virtinst bridge-utils",
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-headers-$(uname -r) || true",
       "sudo modprobe kvm",
       "sudo modprobe kvm_intel || sudo modprobe kvm_amd || true"
     ]
   }
 
-  # Install networking tools
+  # Install networking tools (pre-seed debconf to avoid interactive prompts)
   provisioner "shell" {
     inline = [
-      "sudo apt-get install -y iptables iproute2 net-tools dnsmasq-base",
-      "sudo apt-get install -y bridge-utils"
+      "echo iptables-persistent iptables-persistent/autosave_v4 boolean true | sudo debconf-set-selections",
+      "echo iptables-persistent iptables-persistent/autosave_v6 boolean true | sudo debconf-set-selections",
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y iptables iptables-persistent iproute2 net-tools dnsmasq-base bridge-utils"
     ]
   }
 
   # Install Firecracker
   provisioner "shell" {
     inline = [
-      "ARCH=$(uname -m)",
-      "curl -fsSL https://github.com/firecracker-microvm/firecracker/releases/download/v${var.firecracker_version}/firecracker-v${var.firecracker_version}-$${ARCH}.tgz | sudo tar -xz -C /usr/local/bin",
-      "sudo mv /usr/local/bin/release-v${var.firecracker_version}-$${ARCH}/firecracker-v${var.firecracker_version}-$${ARCH} /usr/local/bin/firecracker",
-      "sudo mv /usr/local/bin/release-v${var.firecracker_version}-$${ARCH}/jailer-v${var.firecracker_version}-$${ARCH} /usr/local/bin/jailer",
-      "sudo rm -rf /usr/local/bin/release-v${var.firecracker_version}-$${ARCH}",
+      "ARCH=x86_64",
+      "curl -fsSL https://github.com/firecracker-microvm/firecracker/releases/download/v${var.firecracker_version}/firecracker-v${var.firecracker_version}-$${ARCH}.tgz | sudo tar -xz -C /tmp",
+      "sudo mv /tmp/release-v${var.firecracker_version}-$${ARCH}/firecracker-v${var.firecracker_version}-$${ARCH} /usr/local/bin/firecracker",
+      "sudo mv /tmp/release-v${var.firecracker_version}-$${ARCH}/jailer-v${var.firecracker_version}-$${ARCH} /usr/local/bin/jailer",
+      "sudo rm -rf /tmp/release-v${var.firecracker_version}-$${ARCH}",
       "sudo chmod +x /usr/local/bin/firecracker /usr/local/bin/jailer",
       "firecracker --version"
     ]
@@ -100,48 +130,16 @@ build {
   # Install Google Cloud SDK
   provisioner "shell" {
     inline = [
+      "curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg",
       "echo 'deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main' | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list",
-      "curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -",
-      "sudo apt-get update && sudo apt-get install -y google-cloud-cli"
-    ]
-  }
-
-  # Install Prometheus node exporter
-  provisioner "shell" {
-    inline = [
-      "NODE_EXPORTER_VERSION=1.7.0",
-      "curl -fsSL https://github.com/prometheus/node_exporter/releases/download/v$${NODE_EXPORTER_VERSION}/node_exporter-$${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin --strip-components=1",
-      "sudo useradd --no-create-home --shell /bin/false node_exporter || true"
-    ]
-  }
-
-  # Create node_exporter systemd service
-  provisioner "shell" {
-    inline = [
-      "cat <<'EOF' | sudo tee /etc/systemd/system/node_exporter.service",
-      "[Unit]",
-      "Description=Node Exporter",
-      "Wants=network-online.target",
-      "After=network-online.target",
-      "",
-      "[Service]",
-      "User=node_exporter",
-      "Group=node_exporter",
-      "Type=simple",
-      "ExecStart=/usr/local/bin/node_exporter",
-      "",
-      "[Install]",
-      "WantedBy=multi-user.target",
-      "EOF",
-      "sudo systemctl daemon-reload",
-      "sudo systemctl enable node_exporter"
+      "sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y google-cloud-cli"
     ]
   }
 
   # Install qemu-img for overlay creation
   provisioner "shell" {
     inline = [
-      "sudo apt-get install -y qemu-utils"
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-utils"
     ]
   }
 
@@ -150,45 +148,23 @@ build {
     inline = [
       "sudo mkdir -p /var/run/firecracker",
       "sudo mkdir -p /var/log/firecracker",
-      "sudo mkdir -p /mnt/nvme/snapshots",
-      "sudo mkdir -p /mnt/nvme/workspaces",
-      "sudo mkdir -p /opt/firecracker-manager"
+      "sudo mkdir -p /mnt/data/snapshots",
+      "sudo mkdir -p /mnt/data/workspaces",
+      "sudo mkdir -p /mnt/data/git-cache",
+      "sudo mkdir -p /opt/firecracker-manager",
+      "sudo mkdir -p /etc/iptables"
     ]
   }
 
-  # Download firecracker-manager and thaw-agent binaries from GCS
-  # These should be uploaded to GCS before running packer:
-  #   gsutil cp bin/firecracker-manager gs://<project>-firecracker-snapshots/bin/
-  #   gsutil cp bin/thaw-agent gs://<project>-firecracker-snapshots/bin/
+  # Download firecracker-manager binary from GCS
+  # Upload binaries before running packer:
+  #   gsutil cp bin/firecracker-manager gs://${project_id}-firecracker-snapshots/bin/
   provisioner "shell" {
     inline = [
-      "# Download binaries from GCS (uploaded during build pipeline)",
-      "# The project ID is derived from the metadata",
-      "PROJECT_ID=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/project/project-id || echo '')",
-      "if [ -n \"$PROJECT_ID\" ]; then",
-      "  gsutil cp gs://$${PROJECT_ID}-firecracker-snapshots/bin/firecracker-manager /tmp/firecracker-manager 2>/dev/null || true",
-      "  gsutil cp gs://$${PROJECT_ID}-firecracker-snapshots/bin/thaw-agent /tmp/thaw-agent 2>/dev/null || true",
-      "  if [ -f /tmp/firecracker-manager ]; then",
-      "    sudo mv /tmp/firecracker-manager /usr/local/bin/firecracker-manager",
-      "    sudo chmod +x /usr/local/bin/firecracker-manager",
-      "    echo 'firecracker-manager binary installed from GCS'",
-      "  else",
-      "    echo 'WARNING: firecracker-manager binary not found in GCS, using placeholder'",
-      "    echo '#!/bin/bash' | sudo tee /usr/local/bin/firecracker-manager",
-      "    echo 'echo \"firecracker-manager placeholder - upload binary to GCS\"' | sudo tee -a /usr/local/bin/firecracker-manager",
-      "    sudo chmod +x /usr/local/bin/firecracker-manager",
-      "  fi",
-      "  if [ -f /tmp/thaw-agent ]; then",
-      "    sudo mv /tmp/thaw-agent /usr/local/bin/thaw-agent",
-      "    sudo chmod +x /usr/local/bin/thaw-agent",
-      "    echo 'thaw-agent binary installed from GCS'",
-      "  fi",
-      "else",
-      "  echo 'Could not determine project ID, creating placeholder'",
-      "  echo '#!/bin/bash' | sudo tee /usr/local/bin/firecracker-manager",
-      "  echo 'echo \"firecracker-manager placeholder\"' | sudo tee -a /usr/local/bin/firecracker-manager",
-      "  sudo chmod +x /usr/local/bin/firecracker-manager",
-      "fi"
+      "gsutil cp gs://${var.project_id}-firecracker-snapshots/bin/firecracker-manager /tmp/firecracker-manager",
+      "sudo mv /tmp/firecracker-manager /usr/local/bin/firecracker-manager",
+      "sudo chmod +x /usr/local/bin/firecracker-manager",
+      "echo 'firecracker-manager binary installed'"
     ]
   }
 
@@ -242,5 +218,3 @@ build {
     ]
   }
 }
-
-

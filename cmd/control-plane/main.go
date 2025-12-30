@@ -129,11 +129,12 @@ func main() {
 	var metricsClient *telemetry.Client
 	if telemetryEnabledVal && gcpProjectVal != "" {
 		telemetryCfg := telemetry.Config{
-			Enabled:      true,
-			ProjectID:    gcpProjectVal,
-			MetricPrefix: "custom.googleapis.com/firecracker",
-			Component:    "control-plane",
-			Environment:  envVal,
+			Enabled:       true,
+			ProjectID:     gcpProjectVal,
+			MetricPrefix:  "custom.googleapis.com/firecracker",
+			Component:     "control-plane",
+			Environment:   envVal,
+			FlushInterval: 10 * time.Second,
 		}
 		var telErr error
 		metricsClient, telErr = telemetry.NewClient(ctx, telemetryCfg, logger)

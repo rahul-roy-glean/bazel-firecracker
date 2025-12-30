@@ -20,7 +20,7 @@ mkdir -p "$OUTPUT_DIR"
 # Build the Docker image from repo root (needed for go.mod, cmd/, pkg/)
 # Force linux/amd64 since Firecracker VMs are x86_64
 echo "Building Docker image for linux/amd64..."
-docker build --platform linux/amd64 -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile" "$REPO_ROOT"
+docker build --platform linux/amd64 -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile.glean" "$REPO_ROOT"
 
 # Create a container (don't run it)
 echo "Creating container..."

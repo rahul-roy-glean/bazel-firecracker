@@ -101,7 +101,7 @@ resource "google_service_account" "host_agent" {
 }
 
 resource "google_service_account" "snapshot_builder" {
-  account_id   = "${local.name_prefix}-snapshot-builder"
+  account_id   = "${local.name_prefix}-snap-builder"
   display_name = "Snapshot Builder"
   description  = "Service account for snapshot builder VMs"
 }
@@ -136,6 +136,13 @@ resource "google_project_iam_member" "host_metrics" {
   project = var.project_id
   role    = "roles/monitoring.metricWriter"
   member  = "serviceAccount:${google_service_account.host_agent.email}"
+}
+
+# IAM for control plane to write metrics
+resource "google_project_iam_member" "control_plane_metrics" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
 resource "google_project_iam_member" "host_logs" {

@@ -1,31 +1,65 @@
 # Production Rollout Guide
 
-Complete step-by-step guide to deploy the Bazel-Firecracker CI runner system.
+Complete step-by-step guide to deploy the Bazel-Firecracker CI runner system from scratch.
 
-## Prerequisites
+## Overview
 
-- GCP Project: `scio-ci`
-- `gcloud` CLI authenticated: `gcloud auth login && gcloud config set project scio-ci`
-- `terraform` >= 1.0.0
-- `packer` >= 1.8.0  
-- `docker` with `gcloud` auth configured
-- `go` >= 1.22
-- `kubectl` and `helm`
+The system consists of:
+1. **Control Plane** - Runs in GKE, handles scheduling and coordination
+2. **Host VMs** - GCE instances running Firecracker manager
+3. **MicroVMs** - Firecracker VMs running GitHub Actions runners
+4. **Supporting Services** - Cloud SQL (PostgreSQL), GCS, Artifact Registry
 
-```bash
-# Verify prerequisites
-gcloud --version
-terraform --version
-packer --version
-docker --version
-go version
-kubectl version --client
-helm version
+```
+GitHub Workflow → Webhook → Control Plane → Allocate Runner → Host VM → Start MicroVM
 ```
 
 ---
 
-## Step 1: Build Go Binaries
+## Prerequisites
+
+### Required Tools
+```bash
+# Verify all tools are installed
+gcloud --version
+terraform --version  # >= 1.0.0
+packer --version     # >= 1.8.0
+docker --version
+go version           # >= 1.22
+kubectl version --client
+helm version
+```
+
+### GCP Authentication
+```bash
+# Login and set project
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project scio-ci
+
+# Verify
+gcloud config get-value project
+```
+
+### Enable Required APIs (one-time)
+```bash
+gcloud services enable \
+  compute.googleapis.com \
+  container.googleapis.com \
+  sqladmin.googleapis.com \
+  storage.googleapis.com \
+  secretmanager.googleapis.com \
+  artifactregistry.googleapis.com \
+  servicenetworking.googleapis.com \
+  monitoring.googleapis.com \
+  logging.googleapis.com
+```
+
+---
+
+## Phase 1: Build Artifacts
+
+### Step 1.1: Build Go Binaries
 
 ```bash
 cd /Users/blr/work/bazel-firecracker
@@ -39,51 +73,116 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/control-plane ./cmd/contro
 
 # Verify
 ls -la bin/
+# Should show 4 binaries, 10-60MB each
+```
+
+### Step 1.2: Build MicroVM Root Filesystem
+
+The rootfs contains Ubuntu + GitHub Actions runner + tools.
+
+```bash
+cd /Users/blr/work/bazel-firecracker/images/microvm
+
+# Build the rootfs (requires Docker)
+docker build -f Dockerfile.glean -t microvm-rootfs:latest .
+
+# Export rootfs as ext4 image
+mkdir -p output
+docker run --rm -v $(pwd)/output:/output microvm-rootfs:latest \
+  bash -c "cp /rootfs.img /output/"
+
+# If the above doesn't work, create manually:
+CONTAINER_ID=$(docker create microvm-rootfs:latest)
+docker export $CONTAINER_ID | docker run --rm -i alpine sh -c \
+  'cat > /tmp/rootfs.tar && mke2fs -d /tmp/rootfs.tar -t ext4 /tmp/rootfs.img 4G && cat /tmp/rootfs.img' > output/rootfs.img
+docker rm $CONTAINER_ID
+
+# Verify
+ls -lh output/rootfs.img
+# Should be ~2-4GB
+```
+
+### Step 1.3: Get Firecracker Kernel
+
+```bash
+cd /Users/blr/work/bazel-firecracker/images/microvm
+
+# Download pre-built kernel (or build from source)
+mkdir -p output
+curl -Lo output/kernel.bin \
+  https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.6/x86_64/vmlinux-5.10.198
+
+# Verify
+ls -lh output/kernel.bin
+# Should be ~30MB
 ```
 
 ---
 
-## Step 2: Deploy Base Infrastructure (Phase 1)
+## Phase 2: Deploy Infrastructure
 
-This creates VPC, GKE, Cloud SQL, Artifact Registry, GCS bucket, and IAM.
+### Step 2.1: Create Terraform State Bucket
+
+```bash
+# Create GCS bucket for terraform state (one-time)
+gsutil mb -l us-central1 gs://scio-ci-terraform-state 2>/dev/null || echo "Bucket exists"
+```
+
+### Step 2.2: Configure Terraform Variables
 
 ```bash
 cd /Users/blr/work/bazel-firecracker/deploy/terraform
 
-# Create GCS bucket for terraform state (one-time)
-gsutil mb -l us-central1 gs://scio-ci-terraform-state 2>/dev/null || true
+# Review and update terraform.tfvars
+cat terraform.tfvars
 
-# Initialize terraform
+# Key settings to verify:
+# - project_id = "scio-ci"
+# - use_custom_host_image = false  (IMPORTANT: false for first deploy)
+# - db_password = "..." (change this!)
+# - github_app_id = "360565"
+# - github_runner_labels = "self-hosted,firecracker,Linux,X64,bazel"
+```
+
+### Step 2.3: Initialize and Apply Terraform
+
+```bash
+cd /Users/blr/work/bazel-firecracker/deploy/terraform
+
+# Initialize with GCS backend
 terraform init \
   -backend-config="bucket=scio-ci-terraform-state" \
   -backend-config="prefix=firecracker-bazel-runner"
 
-# Ensure use_custom_host_image=false for initial deploy (no Packer image yet)
-grep "use_custom_host_image" terraform.tfvars
-# Should show: use_custom_host_image = false
-
-# Plan and apply
+# Plan
 terraform plan -out=tfplan
+
+# Apply (creates VPC, GKE, Cloud SQL, GCS, Artifact Registry, IAM)
+# This takes ~15-20 minutes
 terraform apply tfplan
 
-# Capture outputs
-terraform output
+# Save outputs
+terraform output > /tmp/tf-outputs.txt
+cat /tmp/tf-outputs.txt
 ```
 
-**Key outputs to note:**
+**Key Outputs:**
 - `container_registry` - Artifact Registry URL
-- `snapshot_bucket` - GCS bucket name
-- `gke_get_credentials` - Command to get kubectl access
-- `db_private_ip` - Database IP for control plane
+- `snapshot_bucket` - GCS bucket for snapshots
+- `gke_get_credentials` - kubectl setup command
+- `db_private_ip` - Database IP
+- `db_connection_name` - Cloud SQL connection string
 
 ---
 
-## Step 3: Upload Binaries to GCS
+## Phase 3: Upload Artifacts
+
+### Step 3.1: Upload Binaries to GCS
 
 ```bash
 cd /Users/blr/work/bazel-firecracker
 
-# Get bucket name from terraform
+# Get bucket name
 BUCKET=$(terraform -chdir=deploy/terraform output -raw snapshot_bucket)
 echo "Bucket: $BUCKET"
 
@@ -93,28 +192,62 @@ gsutil cp bin/thaw-agent gs://${BUCKET}/bin/
 gsutil cp bin/snapshot-builder gs://${BUCKET}/bin/
 
 # Verify
-gsutil ls gs://${BUCKET}/bin/
+gsutil ls -l gs://${BUCKET}/bin/
 ```
 
----
-
-## Step 4: Build and Push Control Plane Container
+### Step 3.2: Upload MicroVM Artifacts
 
 ```bash
 cd /Users/blr/work/bazel-firecracker
 
-# Get registry URL from terraform
+BUCKET=$(terraform -chdir=deploy/terraform output -raw snapshot_bucket)
+
+# Upload kernel and rootfs
+gsutil cp images/microvm/output/kernel.bin gs://${BUCKET}/current/
+gsutil cp images/microvm/output/rootfs.img gs://${BUCKET}/current/
+
+# Create initial version marker
+echo "v0.0.0-initial" | gsutil cp - gs://${BUCKET}/current/version
+
+# Create empty repo-cache-seed image (sparse 20GB)
+truncate -s 20G /tmp/repo-cache-seed.img
+mkfs.ext4 -F -L BAZEL_REPO_SEED /tmp/repo-cache-seed.img
+gsutil cp /tmp/repo-cache-seed.img gs://${BUCKET}/current/repo-cache-seed.img
+rm /tmp/repo-cache-seed.img
+
+# Create metadata.json
+cat > /tmp/metadata.json << 'EOF'
+{
+  "version": "v0.0.0-initial",
+  "created_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'",
+  "bazel_version": "7.0.0",
+  "repo_commit": "initial"
+}
+EOF
+gsutil cp /tmp/metadata.json gs://${BUCKET}/current/metadata.json
+rm /tmp/metadata.json
+
+# Verify
+gsutil ls -l gs://${BUCKET}/current/
+```
+
+### Step 3.3: Build and Push Control Plane Container
+
+```bash
+cd /Users/blr/work/bazel-firecracker
+
+# Get registry URL
 REGISTRY=$(terraform -chdir=deploy/terraform output -raw container_registry)
 echo "Registry: $REGISTRY"
 
 # Configure docker for Artifact Registry
 gcloud auth configure-docker us-central1-docker.pkg.dev
 
-# Build and push control plane image
+# Build control plane image
 docker build -f deploy/docker/Dockerfile.control-plane -t ${REGISTRY}/control-plane:v1.0.0 .
-docker push ${REGISTRY}/control-plane:v1.0.0
 
-# Tag as latest
+# Push
+docker push ${REGISTRY}/control-plane:v1.0.0
 docker tag ${REGISTRY}/control-plane:v1.0.0 ${REGISTRY}/control-plane:latest
 docker push ${REGISTRY}/control-plane:latest
 
@@ -124,7 +257,9 @@ gcloud artifacts docker images list ${REGISTRY}
 
 ---
 
-## Step 5: Build Packer Host Image
+## Phase 4: Build Host VM Image
+
+### Step 4.1: Build Packer Image
 
 ```bash
 cd /Users/blr/work/bazel-firecracker/deploy/packer
@@ -132,38 +267,48 @@ cd /Users/blr/work/bazel-firecracker/deploy/packer
 # Initialize packer
 packer init host-image.pkr.hcl
 
-# Build the image (takes ~10-15 minutes)
+# Build image (takes ~10-15 minutes)
 packer build \
   -var "project_id=scio-ci" \
   -var "zone=us-central1-a" \
   host-image.pkr.hcl
 
-# Verify image was created
+# Verify
 gcloud compute images list --filter="family=firecracker-host" --project=scio-ci
 ```
 
----
-
-## Step 6: Enable Custom Host Image in Terraform
+### Step 4.2: Update Terraform to Use Custom Image
 
 ```bash
 cd /Users/blr/work/bazel-firecracker/deploy/terraform
 
-# Update terraform.tfvars to use the Packer image
+# Update terraform.tfvars
 sed -i.bak 's/use_custom_host_image = false/use_custom_host_image = true/' terraform.tfvars
 
 # Verify
 grep "use_custom_host_image" terraform.tfvars
 # Should show: use_custom_host_image = true
 
-# Re-apply terraform to update instance template
+# Re-apply to update instance template
 terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
 ---
 
-## Step 7: Set Up Database
+## Phase 5: Deploy Control Plane
+
+### Step 5.1: Connect to GKE
+
+```bash
+# Get GKE credentials
+eval $(terraform -chdir=deploy/terraform output -raw gke_get_credentials)
+
+# Verify
+kubectl get nodes
+```
+
+### Step 5.2: Initialize Database Schema
 
 ```bash
 cd /Users/blr/work/bazel-firecracker
@@ -171,16 +316,15 @@ cd /Users/blr/work/bazel-firecracker
 # Get database connection info
 DB_CONNECTION=$(terraform -chdir=deploy/terraform output -raw db_connection_name)
 DB_IP=$(terraform -chdir=deploy/terraform output -raw db_private_ip)
+DB_PASSWORD=$(grep db_password deploy/terraform/terraform.tfvars | cut -d'"' -f2)
+
 echo "Connection: $DB_CONNECTION"
 echo "IP: $DB_IP"
 
-# Start Cloud SQL Auth Proxy (in background)
+# Option A: Use cloud-sql-proxy (from local machine)
 cloud-sql-proxy ${DB_CONNECTION} --port=5432 &
 PROXY_PID=$!
 sleep 5
-
-# Get password from terraform.tfvars
-DB_PASSWORD=$(grep db_password deploy/terraform/terraform.tfvars | cut -d'"' -f2)
 
 # Create schema
 PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -U postgres -d firecracker_runner -f deploy/database/schema.sql
@@ -189,32 +333,28 @@ PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -U postgres -d firecracker_runner 
 PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -U postgres -d firecracker_runner -c "\dt"
 
 # Stop proxy
-kill $PROXY_PID
+kill $PROXY_PID 2>/dev/null
+
+# Option B: From inside GKE (if local doesn't work)
+# kubectl run psql-client --rm -it --image=postgres:15 -- \
+#   psql "host=${DB_IP} dbname=firecracker_runner user=postgres password=${DB_PASSWORD}"
 ```
 
----
-
-## Step 8: Deploy Control Plane to GKE
+### Step 5.3: Create Kubernetes Secrets
 
 ```bash
 cd /Users/blr/work/bazel-firecracker
 
-# Get GKE credentials
-eval $(terraform -chdir=deploy/terraform output -raw gke_get_credentials)
-
-# Verify connection
-kubectl get nodes
-
-# Create namespace
-kubectl create namespace firecracker-runner || true
-
-# Get values from terraform
+# Get values
 DB_IP=$(terraform -chdir=deploy/terraform output -raw db_private_ip)
 DB_PASSWORD=$(grep db_password deploy/terraform/terraform.tfvars | cut -d'"' -f2)
 BUCKET=$(terraform -chdir=deploy/terraform output -raw snapshot_bucket)
-REGISTRY=$(terraform -chdir=deploy/terraform output -raw container_registry)
+PROJECT_ID=$(terraform -chdir=deploy/terraform output -raw project_id 2>/dev/null || echo "scio-ci")
 
-# Create database secret
+# Create namespace
+kubectl create namespace firecracker-runner 2>/dev/null || true
+
+# Database credentials
 kubectl create secret generic db-credentials \
   --namespace=firecracker-runner \
   --from-literal=host=${DB_IP} \
@@ -222,145 +362,216 @@ kubectl create secret generic db-credentials \
   --from-literal=password=${DB_PASSWORD} \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# Create GitHub webhook secret (generate a new one)
+# GitHub webhook secret
 WEBHOOK_SECRET=$(openssl rand -hex 32)
-echo "GitHub Webhook Secret: $WEBHOOK_SECRET"
-echo "Save this for GitHub webhook configuration!"
+echo ""
+echo "=========================================="
+echo "SAVE THIS WEBHOOK SECRET FOR GITHUB SETUP:"
+echo "$WEBHOOK_SECRET"
+echo "=========================================="
+echo ""
 
 kubectl create secret generic github-credentials \
   --namespace=firecracker-runner \
   --from-literal=webhook_secret=${WEBHOOK_SECRET} \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# Deploy with Helm
-cd deploy/helm/firecracker-runner
+# Verify secrets
+kubectl get secrets -n firecracker-runner
+```
 
-helm upgrade --install firecracker-runner . \
+### Step 5.4: Deploy Control Plane with Helm
+
+```bash
+cd /Users/blr/work/bazel-firecracker
+
+# Get values
+REGISTRY=$(terraform -chdir=deploy/terraform output -raw container_registry)
+BUCKET=$(terraform -chdir=deploy/terraform output -raw snapshot_bucket)
+PROJECT_ID="scio-ci"
+
+# Deploy
+helm upgrade --install firecracker-runner deploy/helm/firecracker-runner \
   --namespace=firecracker-runner \
   --set image.repository=${REGISTRY}/control-plane \
   --set image.tag=v1.0.0 \
   --set config.gcsBucket=${BUCKET} \
+  --set config.gcpProject=${PROJECT_ID} \
+  --set config.environment=prod \
+  --set config.telemetryEnabled=true \
   --wait --timeout=5m
 
-# Verify deployment
+# Verify
 kubectl get pods -n firecracker-runner
 kubectl get svc -n firecracker-runner
 ```
 
 ---
 
-## Step 9: Verify Deployment
+## Phase 6: Verify Deployment
 
-### 9.1: Check Control Plane
+### Step 6.1: Check Control Plane
 
 ```bash
-# Get control plane service
-kubectl get svc -n firecracker-runner control-plane
-
-# Port-forward for local testing
-kubectl port-forward -n firecracker-runner svc/control-plane 8080:8080 &
-
-# Test health endpoint
-curl http://localhost:8080/health
+# Check pod status
+kubectl get pods -n firecracker-runner -w
 
 # Check logs
-kubectl logs -n firecracker-runner -l app.kubernetes.io/name=firecracker-runner -f
+kubectl logs -n firecracker-runner -l app.kubernetes.io/name=firecracker-runner --tail=100
+
+# Port-forward for testing
+kubectl port-forward -n firecracker-runner svc/control-plane 8080:8080 &
+sleep 3
+
+# Test endpoints
+curl http://localhost:8080/health
+curl http://localhost:8080/api/v1/hosts | jq
+curl http://localhost:8080/api/v1/snapshots | jq
 ```
 
-### 9.2: Check Host VMs
+### Step 6.2: Check Host VMs
 
 ```bash
-# List host VMs (should see hosts starting up)
-gcloud compute instances list --filter="name~fc-runner" --project=scio-ci
+# Wait for hosts to start (may take 2-3 minutes)
+watch 'gcloud compute instances list --filter="name~fc-runner" --project=scio-ci'
 
-# Check MIG status
-gcloud compute instance-groups managed describe fc-runner-dev-hosts \
+# Once running, check MIG status
+gcloud compute instance-groups managed describe fc-runner-test-hosts \
+  --region=us-central1 --project=scio-ci 2>/dev/null || \
+gcloud compute instance-groups managed describe fc-runner-prod-hosts \
   --region=us-central1 --project=scio-ci
 
-# SSH to a host (once available)
-HOST_NAME=$(gcloud compute instances list --filter="name~fc-runner-dev-hosts" --format="value(name)" --project=scio-ci | head -1)
-gcloud compute ssh ${HOST_NAME} --zone=us-central1-a --project=scio-ci
+# SSH to a host
+HOST_NAME=$(gcloud compute instances list --filter="name~fc-runner" --format="value(name)" --limit=1 --project=scio-ci)
+echo "Connecting to: $HOST_NAME"
 
-# Inside host, check:
-systemctl status firecracker-manager
-curl localhost:8080/health
-ls -la /mnt/nvme/snapshots/
+gcloud compute ssh ${HOST_NAME} --zone=us-central1-a --project=scio-ci -- bash -c '
+  echo "=== Firecracker Manager Status ==="
+  systemctl status firecracker-manager --no-pager
+  
+  echo ""
+  echo "=== Health Check ==="
+  curl -s localhost:8080/health
+  
+  echo ""
+  echo "=== Ready Check ==="
+  curl -s localhost:8080/ready
+  
+  echo ""
+  echo "=== Snapshot Cache ==="
+  ls -la /mnt/nvme/snapshots/current/ 2>/dev/null || echo "No snapshots yet"
+'
+```
+
+### Step 6.3: Check Host Registration in Control Plane
+
+```bash
+# Should show hosts registered
+curl http://localhost:8080/api/v1/hosts | jq
+
+# Expected output:
+# {
+#   "hosts": [
+#     {
+#       "id": "...",
+#       "instance_name": "fc-runner-test-hosts-xxxx",
+#       "status": "ready",
+#       "total_slots": 6,
+#       "idle_runners": 2,
+#       ...
+#     }
+#   ]
+# }
 ```
 
 ---
 
-## Step 10: Upload Initial MicroVM Artifacts
+## Phase 7: Configure GitHub Integration
 
-The hosts need rootfs, kernel, and cache images to boot VMs.
+### Step 7.1: Get External IP
 
 ```bash
-cd /Users/blr/work/bazel-firecracker
+# Option A: Use LoadBalancer (if configured)
+EXTERNAL_IP=$(kubectl get svc -n firecracker-runner control-plane-external -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
 
-BUCKET=$(terraform -chdir=deploy/terraform output -raw snapshot_bucket)
+# Option B: Use Ingress
+EXTERNAL_IP=$(kubectl get ingress -n firecracker-runner -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null)
 
-# Check if microVM images exist
-ls -la images/microvm/output/
+# Option C: For testing, use port-forward (temporary)
+echo "Using port-forward for testing. For production, configure LoadBalancer or Ingress."
+```
 
-# If you have pre-built images, upload them:
-gsutil cp images/microvm/output/rootfs.img gs://${BUCKET}/current/
-gsutil cp images/microvm/output/kernel.bin gs://${BUCKET}/current/
+### Step 7.2: Configure GitHub Webhook
 
-# Create empty snapshot placeholders (hosts will sync these)
-echo "v0.0.0-initial" > /tmp/version
-gsutil cp /tmp/version gs://${BUCKET}/current/version
+1. Go to **GitHub repo** → **Settings** → **Webhooks** → **Add webhook**
+2. Configure:
+   - **Payload URL**: `http://<EXTERNAL_IP>:8080/webhook/github`
+   - **Content type**: `application/json`
+   - **Secret**: `<WEBHOOK_SECRET from Step 5.3>`
+   - **Events**: Select **"Workflow jobs"** only
+3. Click **Add webhook**
 
-# Create empty repo-cache-seed image (20GB sparse)
-truncate -s 20G /tmp/repo-cache-seed.img
-mkfs.ext4 -F -L BAZEL_REPO_SEED /tmp/repo-cache-seed.img
-gsutil cp /tmp/repo-cache-seed.img gs://${BUCKET}/current/
-rm /tmp/repo-cache-seed.img /tmp/version
+### Step 7.3: Test with a Workflow
 
-# Verify uploads
-gsutil ls -l gs://${BUCKET}/current/
+Create a test workflow in your repo:
+
+```yaml
+# .github/workflows/test-firecracker.yml
+name: Test Firecracker Runner
+on: workflow_dispatch
+
+jobs:
+  test:
+    runs-on: [self-hosted, firecracker, Linux, X64, bazel]
+    steps:
+      - name: Check runner
+        run: |
+          echo "Hello from Firecracker!"
+          uname -a
+          cat /etc/os-release
+          bazel version || echo "Bazel not in PATH"
+```
+
+Trigger the workflow manually and watch logs:
+
+```bash
+# Watch control plane logs
+kubectl logs -n firecracker-runner -l app.kubernetes.io/name=firecracker-runner -f
+
+# Watch host logs
+gcloud compute ssh ${HOST_NAME} --zone=us-central1-a -- journalctl -u firecracker-manager -f
 ```
 
 ---
 
-## Step 11: Test End-to-End
+## Monitoring & Dashboards
 
-### 11.1: Request a Runner via API
+### GCP Cloud Monitoring
+
+With telemetry enabled, you'll see metrics at:
+- **Metrics Explorer**: `custom.googleapis.com/firecracker/*`
+- **Dashboards**: "Firecracker Runner Overview" (auto-created by Terraform)
 
 ```bash
-# If using port-forward:
-CONTROL_PLANE="http://localhost:8080"
-
-# Or get LoadBalancer IP:
-# CONTROL_PLANE_IP=$(kubectl get svc -n firecracker-runner control-plane-external -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-# CONTROL_PLANE="http://${CONTROL_PLANE_IP}:8080"
-
-# Check host registry
-curl ${CONTROL_PLANE}/api/v1/hosts | jq
-
-# Request a runner (simulates webhook)
-curl -X POST "${CONTROL_PLANE}/api/v1/runners/allocate" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "repo": "askscio/scio",
-    "labels": ["self-hosted", "Linux", "X64"]
-  }' | jq
-
-# List runners
-curl ${CONTROL_PLANE}/api/v1/runners | jq
+# View dashboard
+open "https://console.cloud.google.com/monitoring/dashboards?project=scio-ci"
 ```
 
-### 11.2: Configure GitHub Webhook (Optional)
+### Key Metrics
 
-1. Go to GitHub repo → Settings → Webhooks → Add webhook
-2. Payload URL: `http://<CONTROL_PLANE_IP>:8080/api/v1/github/webhook`
-3. Content type: `application/json`
-4. Secret: `<WEBHOOK_SECRET from Step 8>`
-5. Events: Select "Workflow jobs"
+| Metric | Description |
+|--------|-------------|
+| `vm/ready_duration_seconds` | Time for VM to become ready |
+| `host/runners_idle` | Idle runners per host |
+| `host/runners_busy` | Busy runners per host |
+| `control_plane/queue_depth` | Jobs waiting for runners |
+| `snapshot/age_seconds` | Current snapshot age |
 
 ---
 
 ## Quick Reference
 
-### Commands
+### Useful Commands
 
 ```bash
 # Terraform outputs
@@ -370,77 +581,118 @@ terraform -chdir=deploy/terraform output
 eval $(terraform -chdir=deploy/terraform output -raw gke_get_credentials)
 
 # Control plane logs
-kubectl logs -n firecracker-runner -l app.kubernetes.io/name=firecracker-runner -f
+kubectl logs -n firecracker-runner -l app.kubernetes.io/name=firecracker-runner -f --tail=100
 
 # Host VM logs
-gcloud compute ssh <HOST_NAME> --zone=us-central1-a -- journalctl -u firecracker-manager -f
+HOST=$(gcloud compute instances list --filter="name~fc-runner" --format="value(name)" --limit=1)
+gcloud compute ssh $HOST --zone=us-central1-a -- journalctl -u firecracker-manager -f
+
+# Force MIG to recreate instances
+gcloud compute instance-groups managed rolling-action restart fc-runner-test-hosts \
+  --region=us-central1 --project=scio-ci
 ```
 
-### Key Resources
+### Resource Names
 
-| Resource | Name/Path |
-|----------|-----------|
-| GKE Cluster | `fc-runner-dev-control-plane` |
-| Cloud SQL | `fc-runner-dev-db` |
+| Resource | Name |
+|----------|------|
+| GKE Cluster | `fc-runner-{env}-control-plane` |
+| Cloud SQL | `fc-runner-{env}-db` |
 | GCS Bucket | `scio-ci-firecracker-snapshots` |
 | Artifact Registry | `us-central1-docker.pkg.dev/scio-ci/firecracker` |
-| Host MIG | `fc-runner-dev-hosts` |
+| Host MIG | `fc-runner-{env}-hosts` |
 
 ### Ports
 
-| Component | Port | Endpoint |
-|-----------|------|----------|
-| Control Plane HTTP | 8080 | `/health`, `/api/v1/*` |
+| Component | Port | Purpose |
+|-----------|------|---------|
+| Control Plane HTTP | 8080 | Health, API, Webhooks |
 | Control Plane gRPC | 50051 | Host communication |
-| Host Manager HTTP | 8080 | `/health` |
+| Host Manager HTTP | 8080 | Health, metrics |
 | Host Manager gRPC | 50051 | Control plane RPC |
-
-### GCS Structure
-
-```
-gs://scio-ci-firecracker-snapshots/
-├── bin/                    # Built binaries
-│   ├── firecracker-manager
-│   ├── thaw-agent
-│   └── snapshot-builder
-├── current/                # Active snapshot
-│   ├── kernel.bin
-│   ├── rootfs.img
-│   ├── repo-cache-seed.img
-│   ├── vm.state
-│   ├── vm.mem
-│   └── version
-├── cache/                  # Bazel cache image
-│   └── bazel-cache.img
-└── v20241224-XXXXXX/       # Versioned snapshots
-    └── ...
-```
+| MicroVM thaw-agent | 8080 | Health, warmup status |
 
 ---
 
 ## Troubleshooting
 
 ### Hosts not registering
-```bash
-# Check host logs
-gcloud compute ssh <HOST> -- journalctl -u firecracker-manager -n 100
 
-# Verify control plane is reachable from host
-gcloud compute ssh <HOST> -- curl -v http://<CONTROL_PLANE_IP>:8080/health
+```bash
+# Check host is running
+gcloud compute instances list --filter="name~fc-runner"
+
+# SSH and check service
+gcloud compute ssh <HOST> --zone=us-central1-a -- bash -c '
+  systemctl status firecracker-manager
+  journalctl -u firecracker-manager -n 50
+  curl -v localhost:8080/health
+'
+
+# Check control plane is reachable from host
+gcloud compute ssh <HOST> --zone=us-central1-a -- \
+  curl -v http://<CONTROL_PLANE_INTERNAL_IP>:8080/health
 ```
 
-### Control plane not starting
+### Control plane errors
+
 ```bash
 # Check pod status
 kubectl describe pod -n firecracker-runner -l app.kubernetes.io/name=firecracker-runner
 
-# Check secrets exist
-kubectl get secrets -n firecracker-runner
+# Check database connectivity
+kubectl exec -n firecracker-runner -it $(kubectl get pod -n firecracker-runner -l app.kubernetes.io/name=firecracker-runner -o name | head -1) -- \
+  sh -c 'nc -zv $DB_HOST 5432'
+
+# Check secrets
+kubectl get secrets -n firecracker-runner -o yaml
+```
+
+### MicroVM not starting
+
+```bash
+# SSH to host and check
+gcloud compute ssh <HOST> --zone=us-central1-a -- bash -c '
+  # Check snapshot exists
+  ls -la /mnt/nvme/snapshots/current/
+  
+  # Check firecracker binary
+  /usr/local/bin/firecracker --version
+  
+  # Check recent VM logs
+  ls -lt /var/log/firecracker/ | head
+  tail -50 /var/log/firecracker/*.log
+'
 ```
 
 ### Database connection issues
+
 ```bash
-# Verify Cloud SQL proxy works
+# Test from local (via proxy)
 cloud-sql-proxy <CONNECTION_NAME> --port=5432 &
 PGPASSWORD=<password> psql -h 127.0.0.1 -U postgres -d firecracker_runner -c "SELECT 1"
+
+# Check from GKE pod
+kubectl run psql-test --rm -it --image=postgres:15 --restart=Never -- \
+  psql "host=<DB_IP> dbname=firecracker_runner user=postgres password=<password>" -c "SELECT 1"
+```
+
+---
+
+## Teardown
+
+To remove everything:
+
+```bash
+cd /Users/blr/work/bazel-firecracker/deploy/terraform
+
+# Remove deletion protection first (if enabled)
+# Edit main.tf: deletion_protection = false for GKE and Cloud SQL
+
+# Destroy
+terraform destroy
+
+# Clean up GCS buckets manually if needed
+gsutil -m rm -r gs://scio-ci-firecracker-snapshots/
+gsutil rb gs://scio-ci-terraform-state
 ```

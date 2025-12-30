@@ -82,6 +82,12 @@ spec:
               value: {{ .Values.downscaler.maxDrains | quote }}
             - name: DOWNSCALER_HEARTBEAT_STALE
               value: {{ .Values.downscaler.heartbeatStale | quote }}
+            - name: TELEMETRY_ENABLED
+              value: {{ .Values.telemetry.enabled | quote }}
+            - name: TELEMETRY_METRIC_PREFIX
+              value: {{ .Values.telemetry.metricPrefix | quote }}
+            - name: ENVIRONMENT
+              value: {{ .Values.config.environment | default "prod" | quote }}
           resources:
 {{ toYaml .Values.resources | indent 12 }}
           livenessProbe:

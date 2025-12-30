@@ -1,28 +1,16 @@
 [Unit]
-Description=Firecracker Thaw Agent
+Description=Thaw Agent - MicroVM initialization and GitHub runner setup
 After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/thaw-agent
+ExecStart=/usr/local/bin/thaw-agent --runner-dir=/home/gleanuser --runner-user=gleanuser
 Restart=on-failure
 RestartSec=5
-User=root
-Group=root
-
-# Environment
-Environment=MMDS_ENDPOINT=http://169.254.169.254
-Environment=LOG_LEVEL=info
-Environment=WORKSPACE_DIR=/workspace
-Environment=RUNNER_DIR=/home/runner
-
-# Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=thaw-agent
+Environment=LOG_LEVEL=info
 
 [Install]
 WantedBy=multi-user.target
-
-

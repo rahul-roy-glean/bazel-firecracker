@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -135,6 +136,16 @@ func main() {
 
 	log.Info("Thaw agent starting...")
 
+	// Track progress for debugging
+	currentStep := "starting"
+	var stepMutex sync.Mutex
+	setStep := func(step string) {
+		stepMutex.Lock()
+		currentStep = step
+		stepMutex.Unlock()
+		log.WithField("step", step).Info("Boot progress")
+	}
+	
 	// Start a basic health server immediately (for debugging)
 	// This allows us to verify the agent is alive even if MMDS fails
 	go func() {
@@ -142,14 +153,23 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("thaw-agent alive"))
 		})
+		http.HandleFunc("/progress", func(w http.ResponseWriter, r *http.Request) {
+			stepMutex.Lock()
+			step := currentStep
+			stepMutex.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"step": step})
+		})
 		if err := http.ListenAndServe(":8081", nil); err != nil {
 			log.WithError(err).Debug("Early health server failed")
 		}
 	}()
+	setStep("early_health_started")
 
 	// Network is configured by kernel boot parameters (ip=...), so we just need
 	// to wait briefly for the interface to be ready
 	time.Sleep(100 * time.Millisecond)
+	setStep("waiting_for_mmds")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -162,6 +182,7 @@ func main() {
 	}
 
 	bootTimer.Phase("mmds_wait")
+	setStep("mmds_received")
 	log.WithFields(logrus.Fields{
 		"runner_id": mmdsData.Latest.Meta.RunnerID,
 		"host_id":   mmdsData.Latest.Meta.HostID,
@@ -173,6 +194,7 @@ func main() {
 	metrics = telemetry.NewStructuredLogger(log, "thaw-agent", mmdsData.Latest.Meta.RunnerID)
 
 	// Setup shared repo cache overlay (seed is shared across VMs, upper is per-VM).
+	setStep("repo_cache_overlay")
 	if !*skipRepoCache {
 		log.Info("Setting up shared Bazel repository cache overlay...")
 		if err := setupRepoCacheOverlay(); err != nil {
@@ -200,6 +222,7 @@ func main() {
 	bootTimer.Phase("git_cache_mount")
 
 	// Configure network
+	setStep("network_config")
 	if !*skipNetwork {
 		log.Info("Configuring network...")
 		if err := configureNetwork(mmdsData); err != nil {
@@ -236,18 +259,18 @@ func main() {
 		}
 	}
 
-	// Sync git repository
-	if !*skipGitSync && mmdsData.Latest.Job.Repo != "" {
-		log.Info("Syncing git repository...")
-		gitTimer := telemetry.NewStopwatch()
-		if err := syncGitRepo(mmdsData); err != nil {
-			log.WithError(err).Error("Failed to sync git repo")
+	// Setup workspace from git-cache (local copy only, no network fetch)
+	// This gives actions/checkout a head start - it only needs to fetch deltas
+	setStep("git_workspace_setup")
+	if mmdsData.Latest.GitCache.Enabled && mmdsData.Latest.Job.Repo != "" {
+		log.Info("Setting up workspace from git-cache...")
+		if err := setupWorkspaceFromGitCache(mmdsData); err != nil {
+			log.WithError(err).Warn("Failed to setup workspace from git-cache, workflow will do full clone")
 		}
-		bootTimer.Phase("git_sync")
-		if metrics != nil {
-			metrics.LogDuration(telemetry.MetricCacheGitCloneDuration, gitTimer.Elapsed(), nil)
-		}
+	} else {
+		log.Info("Git-cache not enabled, workflow will clone repo")
 	}
+	bootTimer.Phase("git_sync")
 
 	// Check if we're in warmup mode (for snapshot building)
 	if mmdsData.Latest.Meta.Mode == "warmup" {
@@ -277,7 +300,13 @@ func main() {
 	}
 	
 	// Normal runner mode
+	setStep("starting_health_server")
+	// Start health server in background FIRST so we can always monitor the VM
+	go startHealthServer(mmdsData)
+	log.Info("Health server started in background")
+
 	// Register GitHub runner
+	setStep("github_registration")
 	if !*skipRunner && mmdsData.Latest.Job.GitHubRunnerToken != "" {
 		log.Info("Registering GitHub runner...")
 		if err := registerGitHubRunner(mmdsData); err != nil {
@@ -302,11 +331,10 @@ func main() {
 	log.WithFields(logrus.Fields{
 		"total_ms": bootTimer.Total().Milliseconds(),
 		"phases":   bootTimer.PhaseMap(),
-	}).Info("Thaw agent initialization complete, starting health server...")
+	}).Info("Thaw agent initialization complete")
 
-	// Start health check HTTP server (blocking - runs indefinitely)
-	// This keeps the agent alive to serve health checks and for the manager to verify VM status
-	startHealthServer(mmdsData)
+	// Block forever - health server runs in background, runner runs as separate process
+	select {}
 }
 
 func setupRepoCacheOverlay() error {
@@ -529,11 +557,18 @@ func configureNetwork(data *MMDSData) error {
 	}
 
 	// Check if kernel already configured the network (via ip= boot parameter)
-	// If so, skip reconfiguration to avoid disrupting connectivity
+	// If so, skip IP reconfiguration but still ensure DNS is configured
 	out, _ := exec.Command("ip", "addr", "show", "dev", iface).Output()
 	expectedIP := strings.Split(net.IP, "/")[0]
 	if strings.Contains(string(out), expectedIP) {
-		log.WithField("ip", expectedIP).Info("Network already configured by kernel, skipping")
+		log.WithField("ip", expectedIP).Info("Network IP already configured by kernel, ensuring DNS is set")
+		// Still configure DNS since kernel ip= parameter doesn't set it
+		if net.DNS != "" {
+			resolv := fmt.Sprintf("nameserver %s\n", net.DNS)
+			if err := os.WriteFile("/etc/resolv.conf", []byte(resolv), 0644); err != nil {
+				log.WithError(err).Warn("Failed to write resolv.conf")
+			}
+		}
 		return nil
 	}
 
@@ -639,6 +674,97 @@ func mountGitCache(data *MMDSData) error {
 		"mount":  mountPath,
 	}).Info("Git-cache mounted")
 	return nil
+}
+
+// setupWorkspaceFromGitCache copies the git-cache to workspace (local only, no network)
+// This gives actions/checkout a huge head start - it only needs to fetch deltas
+func setupWorkspaceFromGitCache(data *MMDSData) error {
+	job := data.Latest.Job
+	if job.Repo == "" {
+		return nil
+	}
+
+	// Determine paths
+	gitCachePath := *gitCacheMount
+	if data.Latest.GitCache.MountPath != "" {
+		gitCachePath = data.Latest.GitCache.MountPath
+	}
+
+	workspacePath := *workspaceDir
+	if data.Latest.GitCache.WorkspaceDir != "" {
+		workspacePath = data.Latest.GitCache.WorkspaceDir
+	}
+
+	// Find the cached repo
+	// Git-cache uses simple repo name: /mnt/git-cache/scio (from git_cache_repos config)
+	// Workspace uses GitHub Actions convention: /mnt/ephemeral/workdir/scio/scio
+	repoFullPath := extractRepoDir(job.Repo) // Returns "scio/scio" for askscio/scio
+	parts := strings.Split(job.Repo, "/")
+	simpleRepoName := parts[len(parts)-1] // Just "scio"
+	
+	cachePath := filepath.Join(gitCachePath, simpleRepoName) // /mnt/git-cache/scio
+	targetPath := filepath.Join(workspacePath, repoFullPath) // /mnt/ephemeral/workdir/scio/scio
+
+	// Check if git-cache has this repo
+	if _, err := os.Stat(filepath.Join(cachePath, ".git")); os.IsNotExist(err) {
+		return fmt.Errorf("repo not found in git-cache: %s", cachePath)
+	}
+
+	log.WithFields(logrus.Fields{
+		"cache":  cachePath,
+		"target": targetPath,
+		"repo":   job.Repo,
+	}).Info("Copying git-cache to workspace")
+
+	// Create workspace directory
+	if err := os.MkdirAll(workspacePath, 0755); err != nil {
+		return fmt.Errorf("failed to create workspace: %w", err)
+	}
+
+	// Use git clone --reference for efficient local copy
+	// --dissociate makes it independent (copies objects instead of linking)
+	// --no-checkout is fast, actions/checkout will do the checkout
+	cloneCmd := exec.Command("git", "clone",
+		"--reference", cachePath,
+		"--dissociate",
+		"--no-checkout",
+		"file://"+cachePath, // Local clone
+		targetPath,
+	)
+	cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	
+	if output, err := cloneCmd.CombinedOutput(); err != nil {
+		// If target exists, try to set it up as alternates instead
+		if _, statErr := os.Stat(targetPath); statErr == nil {
+			log.Info("Target exists, setting up alternates instead")
+			return setupGitAlternates(targetPath, cachePath)
+		}
+		return fmt.Errorf("git clone failed: %s: %w", string(output), err)
+	}
+
+	// Set remote to the real GitHub URL (so fetch works)
+	repoURL := "https://github.com/" + job.Repo
+	if err := exec.Command("git", "-C", targetPath, "remote", "set-url", "origin", repoURL).Run(); err != nil {
+		log.WithError(err).Warn("Failed to set remote URL")
+	}
+
+	// Make it writable for the runner user
+	exec.Command("chown", "-R", *runnerUsername+":"+*runnerUsername, targetPath).Run()
+
+	log.WithField("target", targetPath).Info("Workspace setup from git-cache complete")
+	return nil
+}
+
+// setupGitAlternates configures an existing repo to use git-cache objects
+func setupGitAlternates(repoPath, cachePath string) error {
+	alternatesFile := filepath.Join(repoPath, ".git", "objects", "info", "alternates")
+	cacheObjects := filepath.Join(cachePath, ".git", "objects")
+
+	if err := os.MkdirAll(filepath.Dir(alternatesFile), 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(alternatesFile, []byte(cacheObjects+"\n"), 0644)
 }
 
 func syncGitRepo(data *MMDSData) error {
@@ -918,10 +1044,10 @@ func registerGitHubRunner(data *MMDSData) error {
 		repoURL = "https://github.com/" + repoURL
 	}
 
-	// Build labels
+	// Build labels - GitHub expects just label names, not key=value pairs
 	var labels []string
-	for k, v := range job.Labels {
-		labels = append(labels, fmt.Sprintf("%s=%s", k, v))
+	for k := range job.Labels {
+		labels = append(labels, k)
 	}
 	labelsStr := strings.Join(labels, ",")
 
@@ -953,8 +1079,11 @@ func registerGitHubRunner(data *MMDSData) error {
 		log.Info("Runner configured as persistent (multiple jobs)")
 	}
 
-	// Configure runner as 'runner' user
-	configCmd := exec.Command(filepath.Join(runnerPath, "config.sh"), configArgs...)
+	// Configure runner as 'runner' user with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	configCmd := exec.CommandContext(ctx, filepath.Join(runnerPath, "config.sh"), configArgs...)
 	configCmd.Dir = runnerPath
 	configCmd.Stdout = os.Stdout
 	configCmd.Stderr = os.Stderr
@@ -966,12 +1095,16 @@ func registerGitHubRunner(data *MMDSData) error {
 	}
 	configCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
 
-	log.Info("Configuring GitHub runner...")
+	log.Info("Configuring GitHub runner (timeout: 120s)...")
 	if err := configCmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("runner config timed out after 120s")
+		}
 		return fmt.Errorf("runner config failed: %w", err)
 	}
 
 	// Start runner in background as 'runner' user
+	// Use setsid to create a new session so runner survives if thaw-agent exits
 	runCmd := exec.Command(filepath.Join(runnerPath, "run.sh"))
 	runCmd.Dir = runnerPath
 	runCmd.Stdout = os.Stdout
@@ -981,6 +1114,7 @@ func registerGitHubRunner(data *MMDSData) error {
 			Uid: uint32(uid),
 			Gid: uint32(gid),
 		},
+		Setsid: true, // Create new session so runner survives parent exit
 	}
 	runCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
 
@@ -988,6 +1122,7 @@ func registerGitHubRunner(data *MMDSData) error {
 	if err := runCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start runner: %w", err)
 	}
+	log.WithField("pid", runCmd.Process.Pid).Info("GitHub runner started successfully")
 
 	return nil
 }
@@ -1115,15 +1250,31 @@ func updateWarmupState(phase, message string) {
 
 // startHealthServer starts a simple HTTP server for health checks and testing
 func startHealthServer(mmdsData *MMDSData) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.WithField("panic", r).Error("Health server panicked!")
+		}
+	}()
+	
+	log.Info("Creating health server on :8080...")
+	
+	// Use a separate ServeMux to avoid conflicts with the default mux (used by :8081)
 	mux := http.NewServeMux()
 
 	// Health check endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// Safely access MMDS data
+		runnerID := ""
+		mode := ""
+		if mmdsData != nil {
+			runnerID = mmdsData.Latest.Meta.RunnerID
+			mode = mmdsData.Latest.Meta.Mode
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":    "healthy",
-			"runner_id": mmdsData.Latest.Meta.RunnerID,
-			"mode":      mmdsData.Latest.Meta.Mode,
+			"runner_id": runnerID,
+			"mode":      mode,
 			"uptime":    time.Since(globalWarmupState.StartedAt).String(),
 		})
 	})
@@ -1166,8 +1317,10 @@ func startHealthServer(mmdsData *MMDSData) {
 		Handler: mux,
 	}
 
-	log.Info("Starting health server on :8080")
+	log.Info("Attempting to start health server on :8080...")
 	if err := server.ListenAndServe(); err != nil {
-		log.WithError(err).Warn("Health server stopped")
+		log.WithError(err).Error("Health server on :8080 failed to start or stopped")
+	} else {
+		log.Info("Health server on :8080 stopped gracefully")
 	}
 }

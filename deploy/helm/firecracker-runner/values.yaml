@@ -43,6 +43,12 @@ containerSecurityContext: {}
 config:
   # Used by the control plane for snapshot versioning/artifacts.
   gcsBucket: scio-ci-firecracker-snapshots
+  
+  # GCP project ID for telemetry and GCP API calls
+  gcpProject: scio-ci
+  
+  # Environment name (dev, staging, prod) for telemetry labels
+  environment: prod
 
   # Optional: used for future config expansion; control-plane currently reads env vars.
   configYaml: |
@@ -79,6 +85,12 @@ gcp:
   region: us-central1
   hostMigName: fc-runner-dev-hosts
   hostAutoscalerName: fc-runner-dev-hosts-autoscaler
+
+telemetry:
+  # Enable GCP Cloud Monitoring metrics
+  enabled: true
+  # Custom metric prefix (default: custom.googleapis.com/firecracker)
+  metricPrefix: custom.googleapis.com/firecracker
 
 downscaler:
   enabled: true

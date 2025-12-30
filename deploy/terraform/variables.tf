@@ -28,9 +28,15 @@ variable "host_machine_type" {
 }
 
 variable "host_disk_size_gb" {
-  description = "Boot disk size for host VMs in GB"
+  description = "Boot disk size for host VMs in GB (OS + binaries only)"
   type        = number
-  default     = 200
+  default     = 50
+}
+
+variable "host_data_disk_size_gb" {
+  description = "Data disk size for snapshots/workspaces in GB (pd-ssd)"
+  type        = number
+  default     = 500
 }
 
 variable "min_hosts" {
@@ -146,6 +152,18 @@ variable "github_runner_labels" {
   description = "Comma-separated labels for GitHub Actions runners (e.g., 'self-hosted,firecracker,Linux,X64,bazel')"
   type        = string
   default     = "self-hosted,firecracker,Linux,X64"
+}
+
+variable "github_repo" {
+  description = "GitHub repository for runner registration (e.g., 'askscio/scio')"
+  type        = string
+  default     = ""
+}
+
+variable "github_runner_enabled" {
+  description = "Enable automatic GitHub runner registration in microVMs"
+  type        = bool
+  default     = false
 }
 
 # MicroVM configuration per host

@@ -1,12 +1,5 @@
 [Match]
 Name=eth0
 
-[Link]
-# Don't block boot waiting for network
-RequiredForOnline=no
-
 [Network]
-# Network is configured by kernel boot parameters (ip=...)
-# systemd-networkd should not reconfigure the interface
-# Just keep the interface up and accept kernel config
-KeepConfiguration=yes
+DHCP=no

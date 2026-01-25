@@ -322,6 +322,121 @@ func (n *NATNetwork) ReleaseTap(vmID string) error {
 	return nil
 }
 
+// GetOrCreateTapSlot gets or creates a TAP device for a specific slot number.
+// This is used for snapshot-based restore where the TAP device name must match
+// what was used when creating the snapshot.
+//
+// Snapshots bind to specific TAP device names - Firecracker does NOT support
+// changing the host_dev_name after snapshot load. Therefore, we use slot-based
+// TAP names (tap-slot-0, tap-slot-1, etc.) that persist across snapshot/restore cycles.
+func (n *NATNetwork) GetOrCreateTapSlot(slot int, vmID string) (*TapDevice, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	tapName := fmt.Sprintf("tap-slot-%d", slot)
+
+	// Allocate IP based on slot (deterministic: slot 0 = .2, slot 1 = .3, etc.)
+	slotIP := incrementIP(n.subnet.IP, uint32(slot+2))
+	mac := generateMAC(slotIP)
+
+	n.logger.WithFields(logrus.Fields{
+		"tap":   tapName,
+		"slot":  slot,
+		"vm_id": vmID,
+		"ip":    slotIP.String(),
+		"mac":   mac,
+	}).Debug("Getting or creating TAP slot")
+
+	// Check if TAP already exists
+	link, err := netlink.LinkByName(tapName)
+	if err == nil {
+		// TAP exists, ensure it's up and on the bridge
+		if err := netlink.LinkSetUp(link); err != nil {
+			return nil, fmt.Errorf("failed to bring up existing TAP: %w", err)
+		}
+		n.logger.WithField("tap", tapName).Debug("Using existing TAP device")
+		n.allocatedIPs[vmID] = slotIP
+		return &TapDevice{
+			Name:       tapName,
+			IP:         slotIP,
+			Gateway:    n.gateway,
+			Subnet:     n.subnet,
+			MAC:        mac,
+			BridgeName: n.bridgeName,
+		}, nil
+	}
+
+	// Create new TAP device
+	tap := &netlink.Tuntap{
+		LinkAttrs: netlink.LinkAttrs{
+			Name: tapName,
+		},
+		Mode:  netlink.TUNTAP_MODE_TAP,
+		Flags: netlink.TUNTAP_DEFAULTS,
+	}
+
+	if err := netlink.LinkAdd(tap); err != nil {
+		return nil, fmt.Errorf("failed to create TAP device: %w", err)
+	}
+
+	// Get the link
+	link, err = netlink.LinkByName(tapName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get TAP link: %w", err)
+	}
+
+	// Attach to bridge
+	bridge, err := netlink.LinkByName(n.bridgeName)
+	if err != nil {
+		netlink.LinkDel(link)
+		return nil, fmt.Errorf("failed to get bridge: %w", err)
+	}
+
+	if err := netlink.LinkSetMaster(link, bridge); err != nil {
+		netlink.LinkDel(link)
+		return nil, fmt.Errorf("failed to attach TAP to bridge: %w", err)
+	}
+
+	// Bring TAP up
+	if err := netlink.LinkSetUp(link); err != nil {
+		netlink.LinkDel(link)
+		return nil, fmt.Errorf("failed to bring up TAP: %w", err)
+	}
+
+	n.allocatedIPs[vmID] = slotIP
+	n.logger.WithFields(logrus.Fields{
+		"tap":  tapName,
+		"slot": slot,
+		"ip":   slotIP.String(),
+	}).Info("TAP slot created successfully")
+
+	return &TapDevice{
+		Name:       tapName,
+		IP:         slotIP,
+		Gateway:    n.gateway,
+		Subnet:     n.subnet,
+		MAC:        mac,
+		BridgeName: n.bridgeName,
+	}, nil
+}
+
+// ReleaseTapSlot releases a TAP slot but does NOT delete the TAP device.
+// The TAP device persists for reuse with future snapshot restores.
+func (n *NATNetwork) ReleaseTapSlot(slot int, vmID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	tapName := fmt.Sprintf("tap-slot-%d", slot)
+	n.logger.WithFields(logrus.Fields{
+		"tap":   tapName,
+		"slot":  slot,
+		"vm_id": vmID,
+	}).Debug("Releasing TAP slot (keeping TAP device)")
+
+	// Release IP allocation but keep the TAP device for reuse
+	n.releaseIP(vmID)
+}
+
 // allocateIP allocates an IP address for a VM
 func (n *NATNetwork) allocateIP(vmID string) (net.IP, error) {
 	if ip, exists := n.allocatedIPs[vmID]; exists {

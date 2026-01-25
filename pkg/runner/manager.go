@@ -36,6 +36,11 @@ type Manager struct {
 	gitCacheImage string
 	// githubClient generates runner registration tokens for auto-registration
 	githubClient *github.TokenClient
+	// slotToRunner tracks which runner is using each TAP slot (for snapshot restore).
+	// Key is slot number (0, 1, 2, ...), value is runner ID.
+	slotToRunner map[int]string
+	// runnerToSlot is the reverse mapping for quick lookup during cleanup.
+	runnerToSlot map[string]int
 	draining     bool
 	mu           sync.RWMutex
 	logger       *logrus.Entry
@@ -131,6 +136,8 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		buildbarnCertsImage: buildbarnCertsImg,
 		gitCacheImage:       gitCacheImg,
 		githubClient:        githubClient,
+		slotToRunner:        make(map[int]string),
+		runnerToSlot:        make(map[string]int),
 		logger:              logger.WithField("component", "runner-manager"),
 	}, nil
 }
@@ -168,17 +175,48 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	runnerID := uuid.New().String()
 	m.logger.WithField("runner_id", runnerID).Info("Allocating new runner")
 
-	// Create TAP device
-	tap, err := m.network.CreateTapForVM(runnerID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create TAP device: %w", err)
-	}
-
-	// Get snapshot paths
+	// Get snapshot paths first to determine if we should use slot-based TAP allocation
 	snapshotPaths, err := m.snapshotCache.GetSnapshotPaths()
 	if err != nil {
-		m.network.ReleaseTap(runnerID)
 		return nil, fmt.Errorf("failed to get snapshot paths: %w", err)
+	}
+
+	// Determine if snapshot restore is available
+	useSnapshotRestore := snapshotPaths.Mem != "" && snapshotPaths.State != ""
+
+	// Allocate TAP device
+	// For snapshot restore, we MUST use slot-based allocation because Firecracker
+	// does not support changing host_dev_name after snapshot load. The snapshot was
+	// created with tap-slot-0, so we need to use matching slot names.
+	var tap *network.TapDevice
+	var slot int = -1
+	if useSnapshotRestore {
+		// Find an available slot
+		slot = m.findAvailableSlot()
+		if slot < 0 {
+			return nil, fmt.Errorf("no TAP slots available (all %d slots in use)", m.config.MaxRunners)
+		}
+		tap, err = m.network.GetOrCreateTapSlot(slot, runnerID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get TAP slot %d: %w", slot, err)
+		}
+		m.slotToRunner[slot] = runnerID
+		m.runnerToSlot[runnerID] = slot
+		m.logger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"slot":      slot,
+			"tap":       tap.Name,
+		}).Debug("Using slot-based TAP for snapshot restore")
+	} else {
+		// Cold boot path - use dynamic TAP allocation
+		tap, err = m.network.CreateTapForVM(runnerID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TAP device: %w", err)
+		}
+		m.logger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"tap":       tap.Name,
+		}).Debug("Using dynamic TAP for cold boot")
 	}
 
 	// Create rootfs overlay
@@ -659,8 +697,15 @@ func errorsToStrings(errs []error) []string {
 
 // cleanupRunner cleans up runner resources
 func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpperPath string) {
-	// Release TAP device
-	m.network.ReleaseTap(runnerID)
+	// Release TAP slot if using slot-based allocation
+	if slot, ok := m.runnerToSlot[runnerID]; ok {
+		m.network.ReleaseTapSlot(slot, runnerID)
+		delete(m.slotToRunner, slot)
+		delete(m.runnerToSlot, runnerID)
+	} else {
+		// Release dynamic TAP device (cold boot path)
+		m.network.ReleaseTap(runnerID)
+	}
 
 	// Remove overlay
 	if overlayPath != "" {
@@ -675,6 +720,17 @@ func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpper
 	// Remove socket
 	socketPath := filepath.Join(m.config.SocketDir, runnerID+".sock")
 	os.Remove(socketPath)
+}
+
+// findAvailableSlot finds the first available TAP slot for snapshot restore.
+// Returns -1 if no slots are available.
+func (m *Manager) findAvailableSlot() int {
+	for i := 0; i < m.config.MaxRunners; i++ {
+		if _, inUse := m.slotToRunner[i]; !inUse {
+			return i
+		}
+	}
+	return -1
 }
 
 // buildDrives constructs the list of block devices to attach to a microVM.

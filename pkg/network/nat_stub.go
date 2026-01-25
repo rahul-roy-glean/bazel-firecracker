@@ -61,6 +61,13 @@ func (n *NATNetwork) ReleaseTap(_ string) error {
 	return nil
 }
 
+func (n *NATNetwork) GetOrCreateTapSlot(_ int, _ string) (*TapDevice, error) {
+	return nil, fmt.Errorf("TAP devices are only supported on Linux")
+}
+
+func (n *NATNetwork) ReleaseTapSlot(_ int, _ string) {
+}
+
 func (n *NATNetwork) GetGateway() net.IP {
 	return nil
 }

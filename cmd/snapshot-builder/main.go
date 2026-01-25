@@ -63,7 +63,11 @@ func main() {
 	defer cancel()
 
 	// Generate version string
-	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), (*repoBranch)[:8])
+	branchSuffix := *repoBranch
+	if len(branchSuffix) > 8 {
+		branchSuffix = branchSuffix[:8]
+	}
+	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), branchSuffix)
 	log.WithField("version", version).Info("Building snapshot")
 
 	// Create output directory
@@ -121,13 +125,17 @@ func main() {
 	}
 
 	// Create TAP device for warmup VM networking
+	// IMPORTANT: Use slot-based TAP name (tap-slot-0) so the snapshot is compatible
+	// with the manager's slot-based allocation. Firecracker does NOT support changing
+	// host_dev_name after snapshot load, so the TAP name in the snapshot must match
+	// what the manager uses at restore time.
 	vmID := "snapshot-builder"
-	tapName := "tap-warmup"
-	guestIP := "172.16.0.2"
-	guestMAC := "AA:FC:00:00:00:01"
+	tapName := "tap-slot-0" // Must match manager's slot naming for snapshot compatibility
+	guestIP := "172.16.0.2" // Slot 0 always gets .2
+	guestMAC := "AA:FC:00:00:00:02" // Deterministic MAC based on slot
 	hostIP := "172.16.0.1"
 	netmask := "255.255.255.0"
-	
+
 	log.Info("Setting up network for warmup VM...")
 	if err := setupWarmupNetwork(tapName, hostIP); err != nil {
 		log.WithError(err).Fatal("Failed to setup warmup network")
@@ -538,7 +546,8 @@ func getGitCommit(dir string) string {
 	return commit
 }
 
-// setupWarmupNetwork creates the TAP device and configures host networking
+// setupWarmupNetwork creates the TAP device and connects it to the existing bridge.
+// The host is expected to have a bridge (fcbr0) with IP 172.16.0.1/24 already configured.
 func setupWarmupNetwork(tapName, hostIP string) error {
 	// Create TAP device
 	if output, err := exec.Command("ip", "tuntap", "add", "dev", tapName, "mode", "tap").CombinedOutput(); err != nil {
@@ -547,27 +556,35 @@ func setupWarmupNetwork(tapName, hostIP string) error {
 			return fmt.Errorf("failed to create tap: %s: %w", string(output), err)
 		}
 	}
-	
-	// Configure TAP IP
-	if output, err := exec.Command("ip", "addr", "add", hostIP+"/24", "dev", tapName).CombinedOutput(); err != nil {
-		if !strings.Contains(string(output), "exists") {
-			return fmt.Errorf("failed to add ip: %s: %w", string(output), err)
+
+	// Try to connect TAP to existing bridge (fcbr0)
+	// This is the preferred setup when the host already has a bridge configured
+	bridgeName := "fcbr0"
+	if output, err := exec.Command("ip", "link", "set", tapName, "master", bridgeName).CombinedOutput(); err != nil {
+		// If bridge doesn't exist, fall back to standalone TAP with its own IP
+		fmt.Printf("Note: Could not add TAP to bridge %s (%s), using standalone network\n", bridgeName, strings.TrimSpace(string(output)))
+		// Configure TAP IP directly
+		if output, err := exec.Command("ip", "addr", "add", hostIP+"/24", "dev", tapName).CombinedOutput(); err != nil {
+			if !strings.Contains(string(output), "exists") {
+				return fmt.Errorf("failed to add ip: %s: %w", string(output), err)
+			}
 		}
 	}
-	
+
 	// Bring TAP up
 	if output, err := exec.Command("ip", "link", "set", tapName, "up").CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to bring tap up: %s: %w", string(output), err)
 	}
-	
+
 	// Enable IP forwarding
 	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
-	
+
 	// Setup NAT for outbound traffic (guest needs internet for warmup)
+	// These rules may already exist from bridge setup, but adding them again is harmless
 	exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.16.0.0/24", "-j", "MASQUERADE").Run()
 	exec.Command("iptables", "-A", "FORWARD", "-i", tapName, "-j", "ACCEPT").Run()
 	exec.Command("iptables", "-A", "FORWARD", "-o", tapName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
-	
+
 	return nil
 }
 

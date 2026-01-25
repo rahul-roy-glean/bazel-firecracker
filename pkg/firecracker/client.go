@@ -344,7 +344,10 @@ func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string) er
 		"socket": c.socketPath,
 	}).Info("Starting Firecracker process")
 
-	cmd := exec.CommandContext(ctx, firecrackerBin,
+	// IMPORTANT: Use context.Background() instead of the passed context.
+	// The Firecracker process should outlive the gRPC request that started it.
+	// Using the request context would kill the VM when the gRPC response is sent.
+	cmd := exec.Command(firecrackerBin,
 		"--api-sock", c.socketPath,
 		"--id", c.vmID,
 	)

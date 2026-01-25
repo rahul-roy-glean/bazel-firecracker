@@ -188,52 +188,40 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 		return fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
-	// Load the snapshot - don't resume yet, we need to patch drives and network first
+	// Load the snapshot and resume immediately.
+	// NOTE: We're resuming directly without patching drives because:
+	// 1. Firecracker's PATCH /drives API has issues after snapshot load
+	// 2. The snapshot was created with the same drive paths we're using
+	// 3. Per-runner overlays can be implemented later using OverlayFS at the host level
 	if err := vm.client.LoadSnapshot(ctx, SnapshotLoadParams{
 		SnapshotPath: snapshotPath,
 		MemBackend: &MemBackend{
 			BackendPath: memPath,
 			BackendType: "File",
 		},
-		ResumeVM: false, // Don't resume yet - need to patch drives and network
+		ResumeVM: resume, // Resume immediately - no drive patching needed
 	}); err != nil {
 		return fmt.Errorf("failed to load snapshot: %w", err)
 	}
 
-	// Patch rootfs drive to point to this runner's overlay
-	vm.logger.WithField("path", vm.config.RootfsPath).Debug("Patching rootfs drive")
-	if err := vm.client.PatchDrive(ctx, "rootfs", vm.config.RootfsPath); err != nil {
-		return fmt.Errorf("failed to patch rootfs drive: %w", err)
-	}
-
-	// Patch all additional drives to point to new backing files
+	// Log configured drives for debugging (not patching them for now)
+	vm.logger.WithField("rootfs_path", vm.config.RootfsPath).Debug("Using rootfs from snapshot (no patching)")
 	for _, drive := range vm.config.Drives {
 		vm.logger.WithFields(logrus.Fields{
 			"drive_id": drive.DriveID,
 			"path":     drive.PathOnHost,
-		}).Debug("Patching drive")
-		if err := vm.client.PatchDrive(ctx, drive.DriveID, drive.PathOnHost); err != nil {
-			return fmt.Errorf("failed to patch drive %s: %w", drive.DriveID, err)
-		}
+		}).Debug("Drive configured (using snapshot path)")
 	}
 
-	// Patch network interface to point to this runner's TAP device
-	// The snapshot was created with eth0, we just change which host TAP it uses
+	// IMPORTANT: Network interface host_dev_name CANNOT be changed after snapshot load.
+	// The TAP device name used when creating the snapshot MUST match the TAP device available
+	// on the host when restoring. We use slot-based TAP names (e.g., "tap-slot-0") to ensure
+	// consistent naming between snapshot creation and restore.
 	if vm.config.NetworkIface != nil {
 		vm.logger.WithFields(logrus.Fields{
 			"iface_id": vm.config.NetworkIface.IfaceID,
 			"host_dev": vm.config.NetworkIface.HostDevName,
-		}).Debug("Patching network interface")
-		if err := vm.client.PatchNetworkInterface(ctx, vm.config.NetworkIface.IfaceID, vm.config.NetworkIface.HostDevName); err != nil {
-			return fmt.Errorf("failed to patch network interface: %w", err)
-		}
-	}
-
-	// Now resume the VM if requested
-	if resume {
-		if err := vm.client.ResumeVM(ctx); err != nil {
-			return fmt.Errorf("failed to resume VM: %w", err)
-		}
+		}).Debug("Network interface uses pre-existing TAP device from snapshot")
 	}
 
 	vm.logger.Info("MicroVM restored from snapshot successfully")

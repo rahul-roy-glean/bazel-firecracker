@@ -275,7 +275,11 @@ func main() {
 	// Check if we're in warmup mode (for snapshot building)
 	if mmdsData.Latest.Meta.Mode == "warmup" {
 		log.Info("Running in WARMUP mode for snapshot building")
-		
+
+		// Start health server in background FIRST so snapshot-builder can poll us
+		go startHealthServer(mmdsData)
+		log.Info("Health server started in background for warmup mode")
+
 		// Run warmup process (blocking until complete)
 		if err := runWarmupMode(mmdsData); err != nil {
 			globalWarmupState.Error = err.Error()
@@ -288,15 +292,15 @@ func main() {
 			globalWarmupState.Duration = time.Since(globalWarmupState.StartedAt).String()
 			log.Info("Warmup completed successfully")
 		}
-		
+
 		// Signal ready
 		if err := signalReady(); err != nil {
 			log.WithError(err).Error("Failed to signal ready")
 		}
-		
-		// Start health server (snapshot-builder will poll warmup status then take snapshot)
-		startHealthServer(mmdsData)
-		return
+
+		// Block forever - snapshot-builder will take snapshot and terminate the VM
+		log.Info("Warmup complete, waiting for snapshot...")
+		select {}
 	}
 	
 	// Normal runner mode
@@ -1309,6 +1313,25 @@ func startHealthServer(mmdsData *MMDSData) {
 			"ping_output":   string(pingOut),
 			"dns_works":     dnsErr == nil,
 			"dns_output":    string(dnsOut),
+		})
+	})
+
+	// Debug endpoint for mounts and block devices
+	mux.HandleFunc("/debug", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mounts, _ := exec.Command("mount").Output()
+		lsblk, _ := exec.Command("lsblk", "-o", "NAME,SIZE,TYPE,MOUNTPOINT").Output()
+		df, _ := exec.Command("df", "-h").Output()
+		bazelVer, _ := exec.Command("bazel", "--version").CombinedOutput()
+		goVer, _ := exec.Command("go", "version").CombinedOutput()
+		runnerCheck, _ := exec.Command("ls", "-la", "/home/runner").CombinedOutput()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"mounts":        string(mounts),
+			"lsblk":         string(lsblk),
+			"df":            string(df),
+			"bazel_version": string(bazelVer),
+			"go_version":    string(goVer),
+			"runner_dir":    string(runnerCheck),
 		})
 	})
 

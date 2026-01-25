@@ -312,8 +312,13 @@ resource "google_compute_instance_template" "firecracker_host" {
     
     # Add git-cache flags if enabled
     if [ "$GIT_CACHE_ENABLED" = "true" ]; then
+      GIT_CACHE_REPOS_CFG=$(curl -sf -H "Metadata-Flavor: Google" \
+        http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-repos || echo "")
       EXEC_START="$EXEC_START --git-cache-enabled=true"
       EXEC_START="$EXEC_START --git-cache-workspace=$GIT_CACHE_WORKSPACE"
+      if [ -n "$GIT_CACHE_REPOS_CFG" ]; then
+        EXEC_START="$EXEC_START --git-cache-repos=$GIT_CACHE_REPOS_CFG"
+      fi
     fi
     
     # Add GitHub runner flags if enabled

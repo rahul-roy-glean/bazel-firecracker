@@ -207,6 +207,16 @@ func (c *Client) PatchNetworkInterface(ctx context.Context, ifaceID, hostDevName
 	return c.doRequest(ctx, http.MethodPatch, fmt.Sprintf("/network-interfaces/%s", ifaceID), patch)
 }
 
+// PatchDrive patches an existing drive to point to a new backing file (used after snapshot restore)
+func (c *Client) PatchDrive(ctx context.Context, driveID, newPathOnHost string) error {
+	c.logger.WithFields(logrus.Fields{
+		"drive_id": driveID,
+		"new_path": newPathOnHost,
+	}).Debug("Patching drive")
+	patch := map[string]string{"drive_id": driveID, "path_on_host": newPathOnHost}
+	return c.doRequest(ctx, http.MethodPatch, fmt.Sprintf("/drives/%s", driveID), patch)
+}
+
 // SetVsock configures a vsock device for host-guest communication
 func (c *Client) SetVsock(ctx context.Context, vsock Vsock) error {
 	c.logger.WithFields(logrus.Fields{

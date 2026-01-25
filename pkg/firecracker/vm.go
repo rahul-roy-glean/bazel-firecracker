@@ -166,9 +166,9 @@ func (vm *VM) Start(ctx context.Context) error {
 	return nil
 }
 
-// RestoreFromSnapshot restores the microVM from a snapshot
-// The snapshot is created WITHOUT network configuration, so we add network after loading.
-// This allows each restored VM to have its own unique TAP device.
+// RestoreFromSnapshot restores the microVM from a snapshot.
+// The snapshot includes network and drive configuration, so we PATCH them to point
+// to new TAP devices and backing files for this specific runner.
 func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath string, resume bool) error {
 	vm.logger.WithFields(logrus.Fields{
 		"snapshot": snapshotPath,
@@ -188,27 +188,44 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 		return fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
-	// Load the snapshot (created without network)
-	// Don't resume yet - we need to add network interface first
+	// Load the snapshot - don't resume yet, we need to patch drives and network first
 	if err := vm.client.LoadSnapshot(ctx, SnapshotLoadParams{
 		SnapshotPath: snapshotPath,
 		MemBackend: &MemBackend{
 			BackendPath: memPath,
 			BackendType: "File",
 		},
-		ResumeVM: false, // Don't resume yet
+		ResumeVM: false, // Don't resume yet - need to patch drives and network
 	}); err != nil {
 		return fmt.Errorf("failed to load snapshot: %w", err)
 	}
 
-	// Add network interface after snapshot load (snapshot was created without network)
+	// Patch rootfs drive to point to this runner's overlay
+	vm.logger.WithField("path", vm.config.RootfsPath).Debug("Patching rootfs drive")
+	if err := vm.client.PatchDrive(ctx, "rootfs", vm.config.RootfsPath); err != nil {
+		return fmt.Errorf("failed to patch rootfs drive: %w", err)
+	}
+
+	// Patch all additional drives to point to new backing files
+	for _, drive := range vm.config.Drives {
+		vm.logger.WithFields(logrus.Fields{
+			"drive_id": drive.DriveID,
+			"path":     drive.PathOnHost,
+		}).Debug("Patching drive")
+		if err := vm.client.PatchDrive(ctx, drive.DriveID, drive.PathOnHost); err != nil {
+			return fmt.Errorf("failed to patch drive %s: %w", drive.DriveID, err)
+		}
+	}
+
+	// Patch network interface to point to this runner's TAP device
+	// The snapshot was created with eth0, we just change which host TAP it uses
 	if vm.config.NetworkIface != nil {
 		vm.logger.WithFields(logrus.Fields{
 			"iface_id": vm.config.NetworkIface.IfaceID,
 			"host_dev": vm.config.NetworkIface.HostDevName,
-		}).Info("Adding network interface after snapshot restore")
-		if err := vm.client.AddNetworkInterface(ctx, *vm.config.NetworkIface); err != nil {
-			vm.logger.WithError(err).Warn("Failed to add network interface (VM will run without network)")
+		}).Debug("Patching network interface")
+		if err := vm.client.PatchNetworkInterface(ctx, vm.config.NetworkIface.IfaceID, vm.config.NetworkIface.HostDevName); err != nil {
+			return fmt.Errorf("failed to patch network interface: %w", err)
 		}
 	}
 

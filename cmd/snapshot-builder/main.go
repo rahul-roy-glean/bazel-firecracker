@@ -111,6 +111,15 @@ func main() {
 		log.WithError(err).Fatal("Failed to create buildbarn-certs image")
 	}
 
+	// Create a placeholder git-cache image so the snapshot includes the same
+	// device layout (drive ID) as the restore path. Hosts will override the backing
+	// file at restore time with their pre-populated git-cache.
+	gitCacheImg := filepath.Join(*outputDir, "git-cache.img")
+	log.Info("Creating placeholder git-cache image...")
+	if err := createExt4ImageMB(gitCacheImg, 64, "GIT_CACHE"); err != nil {
+		log.WithError(err).Fatal("Failed to create git-cache image")
+	}
+
 	// Create TAP device for warmup VM networking
 	vmID := "snapshot-builder"
 	tapName := "tap-warmup"
@@ -163,6 +172,12 @@ func main() {
 			{
 				DriveID:      "buildbarn_certs",
 				PathOnHost:   buildbarnCertsImg,
+				IsRootDevice: false,
+				IsReadOnly:   true,
+			},
+			{
+				DriveID:      "git_cache",
+				PathOnHost:   gitCacheImg,
 				IsRootDevice: false,
 				IsReadOnly:   true,
 			},
@@ -590,6 +605,11 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion string) map[string]interf
 			"job": map[string]interface{}{
 				"repo":   repoURL,
 				"branch": repoBranch,
+			},
+			"git_cache": map[string]interface{}{
+				"enabled":       true,
+				"mount_path":    "/mnt/git-cache",
+				"workspace_dir": "/mnt/ephemeral/workdir",
 			},
 		},
 	}

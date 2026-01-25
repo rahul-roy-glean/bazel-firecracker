@@ -268,14 +268,40 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	// Use fresh boot (not snapshot restore) to ensure networking works
-	// Snapshot restore doesn't support adding network interfaces after load
-	if err := vm.Start(ctx); err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
-		return nil, fmt.Errorf("failed to start VM: %w", err)
+	// Try snapshot restore first (fast path), fall back to cold boot if needed
+	if snapshotPaths.Mem != "" && snapshotPaths.State != "" {
+		m.logger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"snapshot":  snapshotPaths.Version,
+			"mem":       snapshotPaths.Mem,
+			"state":     snapshotPaths.State,
+		}).Info("Restoring runner from snapshot (fast path)")
+
+		if err := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, true); err != nil {
+			m.logger.WithError(err).Warn("Snapshot restore failed, falling back to cold boot")
+			// Stop the failed Firecracker process before retry
+			vm.Stop()
+			// Recreate VM for cold boot
+			vm, err = firecracker.NewVM(vmCfg, m.logger.Logger)
+			if err != nil {
+				m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+				return nil, fmt.Errorf("failed to recreate VM for cold boot: %w", err)
+			}
+			if err := vm.Start(ctx); err != nil {
+				m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+				return nil, fmt.Errorf("failed to start VM (cold boot fallback): %w", err)
+			}
+		}
+	} else {
+		// No snapshot available, cold boot
+		m.logger.WithField("runner_id", runnerID).Info("Starting runner (cold boot - no snapshot available)")
+		if err := vm.Start(ctx); err != nil {
+			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+			return nil, fmt.Errorf("failed to start VM: %w", err)
+		}
 	}
 
-	// Inject MMDS data (VM is already running after Start())
+	// Inject MMDS data (VM is already running after Start() or RestoreFromSnapshot())
 	mmdsData := m.buildMMDSData(ctx, runner, tap, req)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
@@ -347,6 +373,12 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		data.Latest.GitCache.MountPath = m.config.GitCacheMountPath
 		data.Latest.GitCache.RepoMappings = m.config.GitCacheRepoMappings
 		data.Latest.GitCache.WorkspaceDir = m.config.GitCacheWorkspaceDir
+
+		// Ensure Job.Repo is set for git-cache workspace setup
+		// This is needed even if GitHub runner registration fails
+		if data.Latest.Job.Repo == "" && m.config.GitHubRepo != "" {
+			data.Latest.Job.Repo = m.config.GitHubRepo
+		}
 	}
 
 	// Runner configuration
@@ -645,7 +677,8 @@ func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpper
 	os.Remove(socketPath)
 }
 
-// buildDrives constructs the list of block devices to attach to a microVM
+// buildDrives constructs the list of block devices to attach to a microVM.
+// All drives must be present to match the snapshot's drive layout for restore to work.
 func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []firecracker.Drive {
 	drives := []firecracker.Drive{
 		{
@@ -668,17 +701,49 @@ func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []fi
 		},
 	}
 
-	// Add git-cache drive if enabled and available
-	if m.config.GitCacheEnabled && m.gitCacheImage != "" {
+	// Always add git-cache drive to match snapshot drive layout.
+	// If no real git-cache image exists, use a placeholder.
+	// This is required for snapshot restore to work (drive IDs must match).
+	gitCacheImg := m.gitCacheImage
+	if gitCacheImg == "" {
+		gitCacheImg = m.getOrCreateGitCachePlaceholder()
+	}
+	if gitCacheImg != "" {
 		drives = append(drives, firecracker.Drive{
 			DriveID:      "git_cache",
-			PathOnHost:   m.gitCacheImage,
+			PathOnHost:   gitCacheImg,
 			IsRootDevice: false,
 			IsReadOnly:   true,
 		})
 	}
 
 	return drives
+}
+
+// getOrCreateGitCachePlaceholder ensures a placeholder git-cache image exists for snapshot restore compatibility.
+func (m *Manager) getOrCreateGitCachePlaceholder() string {
+	sharedDir := filepath.Join(m.config.WorkspaceDir, "_shared")
+	placeholderPath := filepath.Join(sharedDir, "git-cache-placeholder.img")
+
+	// Check if already exists
+	if _, err := os.Stat(placeholderPath); err == nil {
+		return placeholderPath
+	}
+
+	// Create placeholder directory
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		m.logger.WithError(err).Warn("Failed to create shared dir for git-cache placeholder")
+		return ""
+	}
+
+	// Create small placeholder image (64MB is minimum for ext4)
+	if err := createExt4ImageMB(placeholderPath, 64, "GIT_CACHE"); err != nil {
+		m.logger.WithError(err).Warn("Failed to create git-cache placeholder image")
+		return ""
+	}
+
+	m.logger.WithField("path", placeholderPath).Info("Created git-cache placeholder image for snapshot compatibility")
+	return placeholderPath
 }
 
 func createExt4Image(path string, sizeGB int, label string) error {

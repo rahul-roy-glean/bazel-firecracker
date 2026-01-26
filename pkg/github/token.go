@@ -131,6 +131,7 @@ func (c *TokenClient) GetInstallationToken(ctx context.Context) (string, error) 
 }
 
 // GetRunnerRegistrationToken gets a runner registration token for a repository
+// repo should be in format "owner/repo" (e.g., "askscio/scio")
 func (c *TokenClient) GetRunnerRegistrationToken(ctx context.Context, repo string) (string, error) {
 	installToken, err := c.GetInstallationToken(ctx)
 	if err != nil {
@@ -159,6 +160,41 @@ func (c *TokenClient) GetRunnerRegistrationToken(ctx context.Context, repo strin
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return "", fmt.Errorf("failed to decode runner token: %w", err)
+	}
+
+	return tokenResp.Token, nil
+}
+
+// GetOrgRunnerRegistrationToken gets a runner registration token for an organization
+// This requires the GitHub App to have "Organization self-hosted runners: Read and write" permission
+func (c *TokenClient) GetOrgRunnerRegistrationToken(ctx context.Context, org string) (string, error) {
+	installToken, err := c.GetInstallationToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get installation token: %w", err)
+	}
+
+	url := fmt.Sprintf("https://api.github.com/orgs/%s/actions/runners/registration-token", org)
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, nil)
+	req.Header.Set("Authorization", "token "+installToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get org runner token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to get org runner token: %s - %s", resp.Status, string(body))
+	}
+
+	var tokenResp struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return "", fmt.Errorf("failed to decode org runner token: %w", err)
 	}
 
 	return tokenResp.Token, nil

@@ -65,6 +65,7 @@ var (
 	// GitHub runner auto-registration flags (Option C)
 	githubRunnerEnabled   = flag.Bool("github-runner-enabled", false, "Enable automatic GitHub runner registration at VM boot")
 	githubRepo            = flag.String("github-repo", "", "GitHub repository for runner registration (e.g., askscio/scio)")
+	githubOrg             = flag.String("github-org", "", "GitHub organization for org-level runner registration (e.g., askscio). If set, uses org-level API instead of repo-level")
 	githubRunnerLabels    = flag.String("github-runner-labels", "self-hosted,firecracker,Linux,X64", "Comma-separated runner labels")
 	githubRunnerEphemeral = flag.Bool("runner-ephemeral", true, "Whether runners are ephemeral (one job per VM) or persistent")
 	githubAppID           = flag.String("github-app-id", "", "GitHub App ID for authentication")
@@ -142,6 +143,10 @@ func main() {
 	if githubRepoVal == "" {
 		githubRepoVal = getMetadataAttribute("github-repo")
 	}
+	githubOrgVal := *githubOrg
+	if githubOrgVal == "" {
+		githubOrgVal = getMetadataAttribute("github-org")
+	}
 	githubAppIDVal := *githubAppID
 	if githubAppIDVal == "" {
 		githubAppIDVal = getMetadataAttribute("github-app-id")
@@ -214,6 +219,7 @@ func main() {
 		// GitHub runner auto-registration (Option C)
 		GitHubRunnerEnabled:   githubRunnerEnabledVal,
 		GitHubRepo:            githubRepoVal,
+		GitHubOrg:             githubOrgVal,
 		GitHubRunnerLabels:    githubRunnerLabelsVal,
 		GitHubRunnerEphemeral: runnerEphemeralVal,
 		GitHubAppID:           githubAppIDVal,

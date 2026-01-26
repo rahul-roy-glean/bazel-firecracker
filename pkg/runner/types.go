@@ -169,6 +169,10 @@ type HostConfig struct {
 	GitHubRunnerEnabled bool
 	// GitHubRepo is the repository runners will register to (e.g., "askscio/scio")
 	GitHubRepo string
+	// GitHubOrg is the GitHub organization for org-level runner registration
+	// If set, uses org-level API which requires "Organization self-hosted runners" permission
+	// If empty, uses repo-level API which requires "Administration" permission on the repo
+	GitHubOrg string
 	// GitHubRunnerLabels are labels applied to registered runners
 	GitHubRunnerLabels []string
 	// GitHubRunnerEphemeral controls whether runners exit after one job (true) or persist (false)

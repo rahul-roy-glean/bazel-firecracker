@@ -386,13 +386,26 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 
 	// If GitHub runner auto-registration is enabled and no token provided in request,
 	// get a fresh registration token (Option C: pre-register at boot)
-	if m.githubClient != nil && req.GitHubRunnerToken == "" && m.config.GitHubRepo != "" {
-		token, err := m.githubClient.GetRunnerRegistrationToken(ctx, m.config.GitHubRepo)
+	if m.githubClient != nil && req.GitHubRunnerToken == "" && (m.config.GitHubRepo != "" || m.config.GitHubOrg != "") {
+		var token string
+		var err error
+		var runnerURL string
+
+		if m.config.GitHubOrg != "" {
+			// Use org-level registration (requires "Organization self-hosted runners" permission)
+			token, err = m.githubClient.GetOrgRunnerRegistrationToken(ctx, m.config.GitHubOrg)
+			runnerURL = fmt.Sprintf("https://github.com/%s", m.config.GitHubOrg)
+		} else {
+			// Use repo-level registration (requires "Administration" permission on repo)
+			token, err = m.githubClient.GetRunnerRegistrationToken(ctx, m.config.GitHubRepo)
+			runnerURL = fmt.Sprintf("https://github.com/%s", m.config.GitHubRepo)
+		}
+
 		if err != nil {
 			m.logger.WithError(err).Warn("Failed to get GitHub runner registration token")
 		} else {
 			data.Latest.Job.GitHubRunnerToken = token
-			data.Latest.Job.Repo = m.config.GitHubRepo
+			data.Latest.Job.Repo = runnerURL // Use full URL for runner registration
 			// Convert labels slice to map
 			if len(m.config.GitHubRunnerLabels) > 0 {
 				labels := make(map[string]string)

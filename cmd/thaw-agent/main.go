@@ -1165,13 +1165,18 @@ func runWarmupMode(data *MMDSData) error {
 	if branch == "" {
 		branch = "main"
 	}
-	
-	cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, warmup.RepoURL, repoDir)
-	cloneCmd.Stdout = os.Stdout
-	cloneCmd.Stderr = os.Stderr
-	cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	if err := cloneCmd.Run(); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
+
+	// Skip clone if repo already exists (e.g., pre-populated in rootfs)
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
+		log.Info("Repository already exists, skipping clone")
+	} else {
+		cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, warmup.RepoURL, repoDir)
+		cloneCmd.Stdout = os.Stdout
+		cloneCmd.Stderr = os.Stderr
+		cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if err := cloneCmd.Run(); err != nil {
+			return fmt.Errorf("git clone failed: %w", err)
+		}
 	}
 	
 	// Phase 2: Configure Bazel

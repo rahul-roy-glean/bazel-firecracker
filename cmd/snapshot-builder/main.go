@@ -624,7 +624,7 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion string) map[string]interf
 				"branch": repoBranch,
 			},
 			"git_cache": map[string]interface{}{
-				"enabled":       true,
+				"enabled":       false, // No pre-populated git-cache during warmup
 				"mount_path":    "/mnt/git-cache",
 				"workspace_dir": "/mnt/ephemeral/workdir",
 			},

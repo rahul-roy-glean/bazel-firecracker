@@ -224,6 +224,15 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 		}).Debug("Network interface uses pre-existing TAP device from snapshot")
 	}
 
+	// Configure MMDS after snapshot restore - this is required for MMDS to work
+	// because MMDS config is not persisted in the snapshot
+	if vm.config.MMDSConfig != nil {
+		if err := vm.client.SetMMDSConfig(ctx, *vm.config.MMDSConfig); err != nil {
+			return fmt.Errorf("failed to set MMDS config after restore: %w", err)
+		}
+		vm.logger.Debug("MMDS config set after snapshot restore")
+	}
+
 	vm.logger.Info("MicroVM restored from snapshot successfully")
 	return nil
 }

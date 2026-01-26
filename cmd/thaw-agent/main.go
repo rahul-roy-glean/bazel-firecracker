@@ -298,9 +298,31 @@ func main() {
 			log.WithError(err).Error("Failed to signal ready")
 		}
 
-		// Block forever - snapshot-builder will take snapshot and terminate the VM
-		log.Info("Warmup complete, waiting for snapshot...")
-		select {}
+		// Wait for snapshot to be taken and mode to change
+		// After snapshot restore, MMDS will have new data with mode != "warmup"
+		log.Info("Warmup complete, polling MMDS for mode change (snapshot restore)...")
+		for {
+			time.Sleep(500 * time.Millisecond)
+			
+			newData, err := fetchMMDSData()
+			if err != nil {
+				log.WithError(err).Debug("Failed to fetch MMDS during restore poll")
+				continue
+			}
+			
+			// Check if mode changed from warmup (indicates snapshot was restored)
+			if newData.Latest.Meta.Mode != "warmup" {
+				log.WithFields(logrus.Fields{
+					"old_mode":      "warmup",
+					"new_mode":      newData.Latest.Meta.Mode,
+					"new_runner_id": newData.Latest.Meta.RunnerID,
+				}).Info("Detected snapshot restore - mode changed, continuing to runner mode")
+				mmdsData = newData
+				break
+			}
+		}
+		
+		// Fall through to normal runner mode
 	}
 	
 	// Normal runner mode
@@ -547,6 +569,58 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 
 		return &data, nil
 	}
+}
+
+// fetchMMDSData does a single non-blocking fetch of MMDS data.
+// Unlike waitForMMDS, it doesn't retry or wait for runner_id.
+// Used for polling MMDS after snapshot restore.
+func fetchMMDSData() (*MMDSData, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	
+	// Reuse waitForMMDS logic but with a short timeout
+	// This handles all the JSON parsing complexity
+	return waitForMMDSOnce(ctx)
+}
+
+// waitForMMDSOnce does a single attempt to fetch and parse MMDS data.
+func waitForMMDSOnce(ctx context.Context) (*MMDSData, error) {
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", *mmdsEndpoint+"/latest", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("MMDS returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var data MMDSData
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, fmt.Errorf("failed to parse MMDS: %w", err)
+	}
+
+	// Handle unwrapped format - try to parse directly into Latest
+	if data.Latest.Meta.RunnerID == "" && len(body) > 0 {
+		if err := json.Unmarshal(body, &data.Latest); err == nil {
+			// Successfully parsed directly into Latest
+		}
+	}
+
+	return &data, nil
 }
 
 func configureNetwork(data *MMDSData) error {

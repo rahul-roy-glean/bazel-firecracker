@@ -1383,6 +1383,36 @@ func startHealthServer(mmdsData *MMDSData) {
 		json.NewEncoder(w).Encode(globalWarmupState)
 	})
 
+	// MMDS diagnostic endpoint - queries MMDS directly from inside VM
+	mux.HandleFunc("/mmds-diag", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		
+		// Query MMDS directly
+		client := &http.Client{Timeout: 2 * time.Second}
+		req, _ := http.NewRequest("GET", *mmdsEndpoint+"/latest", nil)
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		
+		var mmdsRaw string
+		var mmdsErr string
+		if err != nil {
+			mmdsErr = err.Error()
+		} else {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			mmdsRaw = string(body)
+		}
+		
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"mmds_endpoint":     *mmdsEndpoint,
+			"mmds_raw":          mmdsRaw,
+			"mmds_error":        mmdsErr,
+			"current_runner_id": mmdsData.Latest.Meta.RunnerID,
+			"current_mode":      mmdsData.Latest.Meta.Mode,
+			"github_token_set":  mmdsData.Latest.Job.GitHubRunnerToken != "",
+		})
+	})
+
 	// Network info endpoint
 	mux.HandleFunc("/network", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

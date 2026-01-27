@@ -301,13 +301,26 @@ func main() {
 		// Wait for snapshot to be taken and mode to change
 		// After snapshot restore, MMDS will have new data with mode != "warmup"
 		log.Info("Warmup complete, polling MMDS for mode change (snapshot restore)...")
+		pollCount := 0
 		for {
 			time.Sleep(500 * time.Millisecond)
+			pollCount++
 			
 			newData, err := fetchMMDSData()
 			if err != nil {
-				log.WithError(err).Debug("Failed to fetch MMDS during restore poll")
+				if pollCount%20 == 0 { // Log every 10 seconds
+					log.WithError(err).WithField("poll_count", pollCount).Info("Failed to fetch MMDS during restore poll")
+				}
 				continue
+			}
+			
+			// Log what we got every 10 seconds for debugging
+			if pollCount%20 == 0 {
+				log.WithFields(logrus.Fields{
+					"poll_count": pollCount,
+					"mode":       newData.Latest.Meta.Mode,
+					"runner_id":  newData.Latest.Meta.RunnerID,
+				}).Info("MMDS poll result")
 			}
 			
 			// Check if mode changed from warmup (indicates snapshot was restored)
@@ -317,7 +330,9 @@ func main() {
 					"new_mode":      newData.Latest.Meta.Mode,
 					"new_runner_id": newData.Latest.Meta.RunnerID,
 				}).Info("Detected snapshot restore - mode changed, continuing to runner mode")
-				mmdsData = newData
+				// Update the existing mmdsData in-place so the health server sees the new data
+				// (the health server has a reference to the original mmdsData)
+				mmdsData.Latest = newData.Latest
 				break
 			}
 		}
